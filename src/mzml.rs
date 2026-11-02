@@ -1,12 +1,21 @@
-//! Minimal in-memory mzML reader: MS2 spectra only (m/z, intensity, RT).
-//! Supports 32/64-bit float, zlib or no compression. Numpress is rejected explicitly.
+//! Minimal in-memory mzML reader: MS1 and MS2 spectra (m/z, intensity, RT, scan number).
 use crate::{inflate::zlib_decompress, sha256::sha256_hex};
 
-pub struct Spectrum { pub rt: f64, pub mz: Vec<f64>, pub inten: Vec<f32> }
+pub struct Spectrum { pub rt: f64, pub scan: u32, pub mz: Vec<f64>, pub inten: Vec<f32> }
+
 pub struct MzData {
-    pub name: String, pub sha256: String, pub spectra: Vec<Spectrum>, pub n_total: usize,
-    /// (rt, value) total-ion and base-peak chromatograms of MS1 (from every MS1 scan) and MS2 scans
-    pub tic1: Vec<[f64; 2]>, pub bpc1: Vec<[f64; 2]>, pub tic2: Vec<[f64; 2]>, pub bpc2: Vec<[f64; 2]>,
+    pub name: String,
+    pub sha256: String,
+    /// MS2 spectra, sorted by retention time
+    pub spectra: Vec<Spectrum>,
+    /// MS1 spectra, sorted by retention time (needed for quantification on the MS1 precursor signal)
+    pub ms1: Vec<Spectrum>,
+    pub n_total: usize,
+    /// (rt, value) total-ion and base-peak chromatograms of MS1 and MS2 scans, same order as `ms1` / `spectra`
+    pub tic1: Vec<[f64; 2]>,
+    pub bpc1: Vec<[f64; 2]>,
+    pub tic2: Vec<[f64; 2]>,
+    pub bpc2: Vec<[f64; 2]>,
 }
 
 fn attr<'a>(tag: &'a str, name: &str) -> Option<&'a str> {
@@ -44,7 +53,25 @@ fn b64(s: &str) -> Vec<u8> {
     out
 }
 
-struct Cur { level: u32, rt: f64, mz: Vec<f64>, inten: Vec<f32> }
+/// "controllerType=0 controllerNumber=1 scan=1234" -> 1234
+fn scan_no(id: &str) -> Option<u32> {
+    let p = id.rfind("scan=")?;
+    let d: String = id[p + 5..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    d.parse().ok()
+}
+
+struct Cur { level: u32, rt: f64, scan: u32, mz: Vec<f64>, inten: Vec<f32> }
+
+fn finish(mut c: Cur) -> Option<Spectrum> {
+    if c.mz.is_empty() || c.mz.len() != c.inten.len() { return None; }
+    if !c.mz.windows(2).all(|w| w[0] <= w[1]) {
+        let mut p: Vec<(f64, f32)> = c.mz.iter().cloned().zip(c.inten.iter().cloned()).collect();
+        p.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        c.mz = p.iter().map(|x| x.0).collect();
+        c.inten = p.iter().map(|x| x.1).collect();
+    }
+    Some(Spectrum { rt: c.rt, scan: c.scan, mz: c.mz, inten: c.inten })
+}
 
 pub fn parse_bytes(name: &str, bytes: &[u8]) -> Result<MzData, String> {
     let sha = sha256_hex(bytes);
@@ -54,8 +81,8 @@ pub fn parse_bytes(name: &str, bytes: &[u8]) -> Result<MzData, String> {
     let name = name.to_string();
 
     let mut spectra: Vec<Spectrum> = Vec::new();
+    let mut ms1: Vec<Spectrum> = Vec::new();
     let mut n_total = 0usize;
-    let (mut tic1, mut bpc1): (Vec<[f64; 2]>, Vec<[f64; 2]>) = (Vec::new(), Vec::new());
     let mut cur: Option<Cur> = None;
     let (mut in_bda, mut in_bin) = (false, false);
     let (mut is64, mut zlib, mut kind, mut unsupported) = (true, false, 0u8, false);
@@ -77,9 +104,9 @@ pub fn parse_bytes(name: &str, bytes: &[u8]) -> Result<MzData, String> {
                                 let mut raw = b64(&bin);
                                 if zlib { raw = zlib_decompress(&raw)?; }
                                 let vals: Vec<f64> = if is64 {
-                                    raw.chunks_exact(8).map(|b| f64::from_le_bytes([b[0],b[1],b[2],b[3],b[4],b[5],b[6],b[7]])).collect()
+                                    raw.chunks_exact(8).map(|b| f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])).collect()
                                 } else {
-                                    raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0],b[1],b[2],b[3]]) as f64).collect()
+                                    raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f64).collect()
                                 };
                                 if kind == 1 { c.mz = vals; } else { c.inten = vals.into_iter().map(|v| v as f32).collect(); }
                             }
@@ -87,22 +114,10 @@ pub fn parse_bytes(name: &str, bytes: &[u8]) -> Result<MzData, String> {
                     }
                     "binaryDataArray" => in_bda = false,
                     "spectrum" => {
-                        if let Some(mut c) = cur.take() {
-                            if c.level == 1 && !c.inten.is_empty() {
-                                // MS1: keep only the chromatogram points, drop the arrays
-                                let tic: f64 = c.inten.iter().map(|&v| v as f64).sum();
-                                let bp = c.inten.iter().cloned().fold(0.0f32, f32::max) as f64;
-                                tic1.push([c.rt, tic]);
-                                bpc1.push([c.rt, bp]);
-                            }
-                            if c.level == 2 && !c.mz.is_empty() && c.mz.len() == c.inten.len() {
-                                if !c.mz.windows(2).all(|w| w[0] <= w[1]) {
-                                    let mut p: Vec<(f64, f32)> = c.mz.iter().cloned().zip(c.inten.iter().cloned()).collect();
-                                    p.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-                                    c.mz = p.iter().map(|x| x.0).collect();
-                                    c.inten = p.iter().map(|x| x.1).collect();
-                                }
-                                spectra.push(Spectrum { rt: c.rt, mz: c.mz, inten: c.inten });
+                        if let Some(c) = cur.take() {
+                            let level = c.level;
+                            if level == 1 || level == 2 {
+                                if let Some(sp) = finish(c) { if level == 1 { ms1.push(sp); } else { spectra.push(sp); } }
                             }
                         }
                     }
@@ -113,7 +128,11 @@ pub fn parse_bytes(name: &str, bytes: &[u8]) -> Result<MzData, String> {
             let selfc = tag.ends_with('/');
             let nm = tag.split(|c: char| c.is_whitespace() || c == '/').next().unwrap_or("");
             match nm {
-                "spectrum" if !selfc => { n_total += 1; cur = Some(Cur { level: 0, rt: 0.0, mz: vec![], inten: vec![] }); }
+                "spectrum" if !selfc => {
+                    n_total += 1;
+                    let scan = attr(tag, "id").and_then(scan_no).unwrap_or(n_total as u32);
+                    cur = Some(Cur { level: 0, rt: 0.0, scan, mz: vec![], inten: vec![] });
+                }
                 "binaryDataArray" if !selfc => { in_bda = true; is64 = true; zlib = false; kind = 0; unsupported = false; }
                 "binary" if !selfc => { in_bin = true; bin.clear(); }
                 "cvParam" => {
@@ -148,13 +167,14 @@ pub fn parse_bytes(name: &str, bytes: &[u8]) -> Result<MzData, String> {
             i = e;
         }
     }
-    if spectra.is_empty() {
-        return Err(format!("{}: no MS2 spectra found (is this centroid/profile MS/MS data in mzML?)", name));
+    if spectra.is_empty() && ms1.is_empty() {
+        return Err(format!("{}: no MS1/MS2 spectra found (is this centroid/profile LC-MS data?)", name));
     }
     spectra.sort_by(|a, b| a.rt.partial_cmp(&b.rt).unwrap_or(std::cmp::Ordering::Equal));
-    tic1.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
-    bpc1.sort_by(|a, b| a[0].partial_cmp(&b[0]).unwrap_or(std::cmp::Ordering::Equal));
-    let tic2: Vec<[f64; 2]> = spectra.iter().map(|s| [s.rt, s.inten.iter().map(|&v| v as f64).sum::<f64>()]).collect();
-    let bpc2: Vec<[f64; 2]> = spectra.iter().map(|s| [s.rt, s.inten.iter().cloned().fold(0.0f32, f32::max) as f64]).collect();
-    Ok(MzData { name, sha256: sha, spectra, n_total, tic1, bpc1, tic2, bpc2 })
+    ms1.sort_by(|a, b| a.rt.partial_cmp(&b.rt).unwrap_or(std::cmp::Ordering::Equal));
+    let tic = |s: &Spectrum| [s.rt, s.inten.iter().map(|&v| v as f64).sum::<f64>()];
+    let bpc = |s: &Spectrum| [s.rt, s.inten.iter().cloned().fold(0.0f32, f32::max) as f64];
+    let (tic1, bpc1) = (ms1.iter().map(tic).collect(), ms1.iter().map(bpc).collect());
+    let (tic2, bpc2) = (spectra.iter().map(tic).collect(), spectra.iter().map(bpc).collect());
+    Ok(MzData { name, sha256: sha, spectra, ms1, n_total, tic1, bpc1, tic2, bpc2 })
 }

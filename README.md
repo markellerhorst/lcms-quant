@@ -13,8 +13,9 @@ reports either **integrated areas (arbitrary units)** or **concentrations from a
 - Direct import of Thermo `.raw` files (via ThermoRawFileParser); converted data is kept **in memory only**
 - Target table: load, edit live inside the program, save under any name
 - Manual integration by dragging boundaries or typing values; baseline subtraction; ion-ratio checks
-- Calibration (linear, weighting none / 1/x / 1/x²), areas-only mode, results matrix for all files
+- Quantification on the **MS2 product-ion area** or the **MS1 precursor area**; calibration (linear, weighting none / 1/x / 1/x²), areas-only mode, results matrix for all files
 - Retention-time alignment (global shift by TIC cross-correlation), TIC / BPC / XIC inspection of one or many files
+- Hover read-out on every chromatogram (m/z, RT, scan number, intensity of the nearest point) and a linked **MS2 spectrum panel** (hovered / pinned / apex scan, target ions highlighted)
 - Explorer-style multi-select (Ctrl / Shift), right-click to remove a file from the project (never deletes it on disk)
 - Projects (`.quant`), undo/redo (10 steps), scientific-notation display, zoom with Ctrl +/-/0, user name in the audit trail
 
@@ -35,10 +36,16 @@ cargo run --release          # or: cargo build --release  -> target/release/lcms
    Test: `dotnet ThermoRawFileParser.dll -v` or `ThermoRawFileParser.exe -v`.
 
 ## Use
-1. Drop a target table `.csv` (`name,rt_min,ions` with `n/a` for unknown RT and ions separated by `;`) and `.raw` files onto the window
-   (or File menu). Mark calibration files as **Standard** and enter their concentrations.
-2. Check/adjust the integrated peaks; drag the green/red lines. Give a reason for manual changes.
+1. Drop a target table `.csv` and `.raw` files onto the window (or use the File menu). Table format: `name,rt_min,ions` – `n/a` for an unknown RT,
+   MS2 product ions separated by `;` (the first is the quantifier) and, optionally, the MS1 precursor as `p:286.1438`, e.g.
+   `Morphine,n/a,286.14;201.07;165.05;p:286.1438`. The precursor is only needed for MS1-based quantification. Mark calibration files as **Standard** and enter their concentrations.
+2. Choose the signal (MS2 product ions or MS1 precursor) in the top bar. Check/adjust the integrated peaks; drag the green/red lines.
+   Give a reason for manual changes. Hover the chromatogram to see m/z, RT and scan; click it to pin the nearest MS2 scan in the spectrum panel.
 3. Export the results (`Export CSV`), save the project (`Ctrl+S`).
+
+## Memory note
+MS1 spectra are kept in memory (needed for MS1-based quantification), so each imported file needs roughly 50–300 MB depending on scan count and peak density.
+Remove files you no longer need (right-click → Remove from project).
 
 ## Test
 ```powershell

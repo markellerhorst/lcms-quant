@@ -32,7 +32,8 @@ impl ProjectFile {
         for a in &self.analytes {
             let rt = a.rt.map(|v| v.to_string()).unwrap_or_else(|| "n/a".into());
             let ions = a.ions.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(";");
-            o += &format!("A\t{}\t{}\t{}\n", clean(&a.name), rt, ions);
+            let prec = a.precursor.map(|v| v.to_string()).unwrap_or_else(|| "n/a".into());
+            o += &format!("A\t{}\t{}\t{}\t{}\n", clean(&a.name), rt, ions, prec);
         }
         for s in &self.samples {
             o += &format!("S\t{}\t{}\t{}\t{}\t{}\t{}\n", clean(&s.path), s.raw_sha256, clean(&s.kind), s.conc, s.rt_shift, s.show);
@@ -59,7 +60,8 @@ impl ProjectFile {
                     let ions: Result<Vec<f64>, _> = f[3].split(';').filter(|s| !s.is_empty()).map(|s| s.parse::<f64>()).collect();
                     let ions = ions.map_err(|_| err("bad ion"))?;
                     if ions.is_empty() { return Err(err("target without ions")); }
-                    p.analytes.push(Analyte { name: f[1].into(), rt, ions });
+                    let precursor = match f.get(4) { Some(s) if *s != "n/a" && !s.is_empty() => Some(s.parse().map_err(|_| err("bad precursor"))?), _ => None };
+                    p.analytes.push(Analyte { name: f[1].into(), rt, ions, precursor });
                 }
                 "S" if f.len() >= 7 => p.samples.push(SampleRec {
                     path: f[1].into(), raw_sha256: f[2].into(), kind: f[3].into(),

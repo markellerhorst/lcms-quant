@@ -8,12 +8,18 @@ fn sup(n: i32) -> String {
     s
 }
 
+/// Retention time in minutes, two decimals: 7.2 -> "7.20".
+pub fn rt2(x: f64) -> String { format!("{:.2}", x) }
+
 /// Up to 6 significant digits, trailing zeros trimmed.
-pub fn sci(x: f64) -> String {
+pub fn sci(x: f64) -> String { sci_prec(x, 6) }
+
+/// Scientific notation with `sig` significant digits (used for m/z so that high-resolution values keep their decimals).
+pub fn sci_prec(x: f64, sig: usize) -> String {
     if x.is_nan() { return "NaN".into(); }
     if x.is_infinite() { return if x > 0.0 { "∞".into() } else { "-∞".into() }; }
     if x == 0.0 { return "0".into(); }
-    let s = format!("{:.5e}", x);
+    let s = format!("{:.*e}", sig.max(1) - 1, x);
     let (m, e) = match s.split_once('e') { Some(p) => p, None => return s };
     let exp: i32 = e.parse().unwrap_or(0);
     let m = if m.contains('.') { m.trim_end_matches('0').trim_end_matches('.') } else { m };

@@ -1,5 +1,12 @@
 #[derive(Clone, Debug, PartialEq)]
-pub struct Analyte { pub name: String, pub rt: Option<f64>, pub ions: Vec<f64> }
+pub struct Analyte {
+    pub name: String,
+    pub rt: Option<f64>,
+    /// MS2 product (diagnostic) ions; the first one is the quantifier
+    pub ions: Vec<f64>,
+    /// optional MS1 precursor m/z, used when quantifying on the MS1 signal
+    pub precursor: Option<f64>,
+}
 
 /// CSV/TSV: name, RT (min or n/a), ions (extra columns, or separated by ; | space). First ion = quantifier.
 pub fn parse_table(text: &str) -> Result<Vec<Analyte>, String> {
@@ -12,15 +19,20 @@ pub fn parse_table(text: &str) -> Result<Vec<Analyte>, String> {
         let name = f[0].trim().trim_matches('"').to_string();
         let rt_s = f[1].trim().trim_matches('"');
         let rt = rt_s.parse::<f64>().ok();
-        let ions: Vec<f64> = f[2..].iter()
-            .flat_map(|s| s.split(|c: char| c.is_whitespace() || c == ';' || c == '|'))
-            .filter_map(|t| t.trim_matches('"').parse::<f64>().ok()).collect();
+        // product ions are plain numbers; an optional MS1 precursor is written "p:286.1438"
+        let mut ions: Vec<f64> = Vec::new();
+        let mut precursor: Option<f64> = None;
+        for t in f[2..].iter().flat_map(|s| s.split(|c: char| c.is_whitespace() || c == ';' || c == '|')) {
+            let t = t.trim_matches('"');
+            if let Some(r) = t.strip_prefix("p:").or_else(|| t.strip_prefix("P:")) { precursor = r.parse::<f64>().ok(); }
+            else if let Ok(v) = t.parse::<f64>() { ions.push(v); }
+        }
         let rt_na = rt_s.is_empty() || rt_s == "-" || rt_s.eq_ignore_ascii_case("n/a") || rt_s.eq_ignore_ascii_case("na");
         if ions.is_empty() || (rt.is_none() && !rt_na) {
             if out.is_empty() { continue; } // header row
             return Err(format!("line {}: cannot parse RT/ions", ln + 1));
         }
-        out.push(Analyte { name, rt, ions });
+        out.push(Analyte { name, rt, ions, precursor });
     }
     if out.is_empty() { Err("no analytes found".into()) } else { Ok(out) }
 }
@@ -169,4 +181,12 @@ pub fn estimate_shift(r: &[[f64; 2]], x: &[[f64; 2]], max: f64) -> f64 {
         if s > best { best = s; best_lag = lag; }
     }
     best_lag as f64 * step
+}
+
+/// Summed intensity of all peaks within +-tol of `target` in one spectrum (m/z must be ascending).
+pub fn intensity_near(mz: &[f64], inten: &[f32], target: f64, tol: f64) -> f64 {
+    let mut i = mz.partition_point(|&x| x < target - tol);
+    let mut sum = 0.0f64;
+    while i < mz.len() && mz[i] <= target + tol { sum += inten[i] as f64; i += 1; }
+    sum
 }

@@ -1,6 +1,6 @@
 //! Unit/integration tests for the non-GUI core. Run: cargo test
 use lcms_quant::{
-    audit, fmt::{parse_sci, sci}, history::History, icon, inflate::zlib_decompress, mzml, project::*, quant::*, sha256::*, testkit,
+    audit, fmt::{parse_sci, rt2, sci, sci_prec}, history::History, icon, inflate::zlib_decompress, mzml, project::*, quant::*, sha256::*, testkit,
 };
 
 // ---------- hashing ----------
@@ -63,6 +63,15 @@ fn scientific_notation_round_trips_through_the_parser() {
     assert_eq!(parse_sci("garbage"), None);
 }
 
+#[test]
+fn retention_times_use_two_decimals_and_mz_keeps_its_digits() {
+    assert_eq!(rt2(7.2), "7.20");
+    assert_eq!(rt2(0.0), "0.00");
+    assert_eq!(rt2(12.3456), "12.35");
+    assert_eq!(sci_prec(286.1438, 9), "2.861438×10²");
+    assert_eq!(sci_prec(150.0, 9), "1.5×10²");
+}
+
 // ---------- undo/redo ----------
 #[test]
 fn history_is_bounded_and_ordered() {
@@ -103,6 +112,10 @@ fn target_table_parsing() {
     assert!(parse_table("").is_err());
     assert!(parse_table("name,rt,ions\nGood,1.0,100\nBad,x,100\n").is_err());
     assert_eq!(parse_table("Drug\t2.5\t100.1\t200.2\n").unwrap()[0].ions, vec![100.1, 200.2]);
+    let p = parse_table("name,rt,ions\nMorphine,n/a,286.14;201.07;p:286.1438\n").unwrap();
+    assert_eq!(p[0].precursor, Some(286.1438));
+    assert_eq!(p[0].ions, vec![286.14, 201.07], "the precursor tag is not a product ion");
+    assert_eq!(parse_table("A,1.0,100\n").unwrap()[0].precursor, None);
 }
 
 // ---------- mzML ----------
@@ -113,6 +126,9 @@ fn mzml_parsing_of_synthetic_run() {
     assert_eq!(d.tic1.len(), 1000, "MS1 points");
     assert_eq!(d.n_total, 2000);
     assert_eq!(d.sha256.len(), 64);
+    assert_eq!(d.ms1.len(), 1000, "MS1 spectra are kept for MS1-based quantification");
+    assert_eq!(d.ms1[3].mz, vec![500.0]);
+    assert_eq!((d.ms1[0].scan, d.spectra[0].scan, d.spectra[1].scan), (0, 1, 3), "scan numbers come from the spectrum id");
     assert!((d.spectra[10].rt - 0.105).abs() < 1e-9, "minute unit");
     assert!((d.tic1[10][0] - 0.1).abs() < 1e-9, "second unit converted to minutes");
     assert_eq!(d.spectra[0].mz, vec![150.0, 250.0, 400.0]);
@@ -218,7 +234,7 @@ fn project_file_round_trip() {
     let pf = ProjectFile {
         app_version: "0.3.0".into(), user: "eller".into(),
         params: vec![("tol".into(), "10".into()), ("mode".into(), "curve".into())],
-        analytes: vec![Analyte { name: "A".into(), rt: None, ions: vec![100.5, 200.25] }, Analyte { name: "B".into(), rt: Some(3.25), ions: vec![300.0] }],
+        analytes: vec![Analyte { name: "A".into(), rt: None, ions: vec![100.5, 200.25], precursor: Some(286.1438) }, Analyte { name: "B".into(), rt: Some(3.25), ions: vec![300.0], precursor: None }],
         samples: vec![SampleRec {
             path: r"C:\data\a b.raw".into(), raw_sha256: "ab".repeat(32), kind: "Standard".into(), conc: 0.1, rt_shift: -0.0123, show: true,
             cells: vec![CellRec { analyte: 0, found: true, manual: true, start: 1.0 / 3.0, end: 2.5, include: false },

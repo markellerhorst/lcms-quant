@@ -1,21 +1,21 @@
 use crate::{
     audit::{self, iso_now, Audit},
-    fmt::{parse_sci, sci},
+    fmt::{parse_sci, sci, sci_prec},
     history::History,
-    mzml::{self, MzData},
+    mzml::{self, MzData, Spectrum},
     project::{CellRec, ProjectFile, SampleRec},
     quant::*,
     rawconv,
 };
 use eframe::egui::{self, Color32, Key, Modifiers, PointerButton, RichText};
-use egui_plot::{Legend, Line, Plot, PlotPoints, Points, Polygon, VLine};
+use egui_plot::{Legend, Line, Plot, PlotPoint, PlotPoints, Points, Polygon, Text, VLine};
 use std::path::{Path, PathBuf};
 use std::sync::{
     mpsc::{channel, Receiver, Sender},
     Arc,
 };
 
-const VERSION: &str = "0.3.0";
+const VERSION: &str = "0.4.0";
 const WEIGHTS: [&str; 3] = ["none", "1/x", "1/x²"];
 const README: &str = include_str!("../README.md");
 const MAX_UNDO: usize = 10;
@@ -30,6 +30,67 @@ macro_rules! sciplot {
                 format!("{}x = {}\ny = {}", head, sci(v.x), sci(v.y))
             })
     };
+}
+
+/// Chromatogram plots: retention-time axis with two decimals, other axes in scientific notation, no default cursor label.
+macro_rules! rtplot {
+    ($p:expr) => {
+        $p.x_axis_formatter(|m, _| format!("{:.2}", m.value))
+            .y_axis_formatter(|m, _| sci(m.value))
+            .show_x(false)
+            .show_y(false)
+    };
+}
+
+/// Draws the traces, finds the point nearest to the cursor and annotates it with m/z, RT, scan number and intensity.
+macro_rules! draw_series {
+    ($pu:ident, $series:expr, $hover:ident, $scan_of:ident) => {{
+        for s in $series.iter() {
+            let d: Vec<[f64; 2]> = s.data.iter().map(|p| [p[0], p[1] * s.scale]).collect();
+            let mut l = Line::new(PlotPoints::from(d)).name(s.name.clone()).color(pal(s.ci));
+            if s.cur { l = l.width(2.5_f32); }
+            $pu.line(l);
+        }
+        if let Some(p) = $pu.pointer_coordinate() {
+            let b = $pu.plot_bounds();
+            $hover = nearest_hover($series, p.x, p.y, b.max()[0] - b.min()[0]);
+        }
+        if let Some(h) = &$hover {
+            let b = $pu.plot_bounds();
+            let right = h.rt > (b.min()[0] + b.max()[0]) / 2.0;
+            let txt = format!("{}\n{}\nRT {:.2} min · scan {}\nintensity {}", h.fname, h.desc, h.rt, $scan_of(h.file, h.level, h.idx), sci(h.y));
+            $pu.points(Points::new(vec![[h.rt, h.y * h.scale]]).radius(5.0_f32).color(Color32::WHITE));
+            $pu.text(Text::new(PlotPoint::new(h.rt, h.y * h.scale),
+                RichText::new(txt).color(Color32::WHITE).background_color(Color32::from_black_alpha(200)))
+                .anchor(if right { egui::Align2::RIGHT_BOTTOM } else { egui::Align2::LEFT_BOTTOM }));
+        }
+    }};
+}
+
+struct Series {
+    name: String, data: Vec<[f64; 2]>, ci: usize, cur: bool, file: usize,
+    /// 1 = points index the MS1 scan list, 2 = the MS2 scan list
+    level: u8, fname: String, desc: String, scale: f64,
+}
+
+struct Hover { file: usize, rt: f64, y: f64, scale: f64, idx: usize, level: u8, fname: String, desc: String }
+
+/// Point of any series closest to the cursor: nearest in time, then the trace whose intensity is closest to the cursor.
+fn nearest_hover(series: &[Series], px: f64, py: f64, width: f64) -> Option<Hover> {
+    let mut best: Option<(f64, Hover)> = None;
+    for s in series {
+        if s.data.is_empty() { continue; }
+        let j = s.data.partition_point(|p| p[0] < px);
+        let (c0, c1) = (j.saturating_sub(1), j.min(s.data.len() - 1));
+        let bj = if (s.data[c1][0] - px).abs() < (s.data[c0][0] - px).abs() { c1 } else { c0 };
+        let p = s.data[bj];
+        if width > 0.0 && (p[0] - px).abs() > 0.05 * width { continue; }
+        let dy = (p[1] * s.scale - py).abs();
+        if best.as_ref().map(|b| dy < b.0).unwrap_or(true) {
+            best = Some((dy, Hover { file: s.file, rt: p[0], y: p[1], scale: s.scale, idx: bj, level: s.level, fname: s.fname.clone(), desc: s.desc.clone() }));
+        }
+    }
+    best.map(|b| b.1)
 }
 
 struct LoadInfo { path: String, raw_sha: String, detail: String }
@@ -61,6 +122,8 @@ enum View { Xic, Tic, Bpc }
 enum Scope { Ions, AllTargets, Files }
 #[derive(Clone, Copy, PartialEq)]
 enum Tab { Chrom, Matrix }
+#[derive(Clone, Copy, PartialEq)]
+enum Basis { Ms2, Ms1 }
 
 #[derive(Clone)]
 struct Cell { start: f64, end: f64, found: bool, manual: bool, areas: Vec<f64>, logged: (f64, f64), include: bool }
@@ -131,13 +194,20 @@ pub struct App {
     align_ref: usize,
     history: History<Snapshot>,
     last_undo_label: String,
-    rows: Vec<[String; 3]>,
+    rows: Vec<[String; 4]>,
     rows_dirty: bool,
     table_path: Option<PathBuf>,
     project_path: Option<PathBuf>,
     pending: Option<Pending>,
     zoom: f32,
     title: String,
+    basis: Basis,
+    show_spectrum: bool,
+    spec_autofit: bool,
+    follow_hover: bool,
+    pinned_scan: Option<(usize, usize)>,
+    hover: Option<(usize, f64)>,
+    col_w: [f32; 4],
 }
 
 fn csv(s: &str) -> String {
@@ -166,15 +236,23 @@ fn dv(v: &mut f64) -> egui::DragValue<'_> {
     egui::DragValue::new(v).custom_formatter(|n, _| sci(n)).custom_parser(parse_sci)
 }
 
-fn parse_row(r: &[String; 3]) -> Option<Analyte> {
+/// DragValue for retention times / durations in minutes: two decimals ("7.20").
+fn dv_rt(v: &mut f64) -> egui::DragValue<'_> {
+    egui::DragValue::new(v).custom_formatter(|n, _| format!("{:.2}", n)).custom_parser(parse_sci)
+}
+
+fn parse_row(r: &[String; 4]) -> Option<Analyte> {
     let name = r[0].trim().to_string();
     if name.is_empty() { return None; }
+    let na = |t: &str| t.is_empty() || t == "-" || t.eq_ignore_ascii_case("n/a") || t.eq_ignore_ascii_case("na");
     let t = r[1].trim();
-    let rt = if t.is_empty() || t == "-" || t.eq_ignore_ascii_case("n/a") || t.eq_ignore_ascii_case("na") { None } else { Some(t.parse::<f64>().ok()?) };
+    let rt = if na(t) { None } else { Some(t.parse::<f64>().ok()?) };
+    let t = r[2].trim();
+    let precursor = if na(t) { None } else { Some(t.parse::<f64>().ok()?) };
     let mut ions = vec![];
-    for tok in r[2].split(|c: char| c == ';' || c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()) { ions.push(tok.parse::<f64>().ok()?); }
+    for tok in r[3].split(|c: char| c == ';' || c == ',' || c.is_whitespace()).filter(|s| !s.is_empty()) { ions.push(tok.parse::<f64>().ok()?); }
     if ions.is_empty() { return None; }
-    Some(Analyte { name, rt, ions })
+    Some(Analyte { name, rt, ions, precursor })
 }
 
 impl App {
@@ -196,6 +274,8 @@ impl App {
             history: History::new(MAX_UNDO), last_undo_label: String::new(),
             rows: vec![], rows_dirty: true, table_path: None, project_path: None, pending: None,
             zoom: 1.0, title: String::new(),
+            basis: Basis::Ms2, show_spectrum: true, spec_autofit: true, follow_hover: true, pinned_scan: None, hover: None,
+            col_w: [0.0; 4],
         };
         app.load_settings();
         app
@@ -227,7 +307,7 @@ impl App {
         vec![
             kv("tol_ppm", self.tol_ppm.to_string()), kv("tol", self.tol.to_string()), kv("rt_win", self.rt_win.to_string()),
             kv("weighting", self.weighting.to_string()), kv("baseline", self.baseline.to_string()), kv("ratio_tol", self.ratio_tol.to_string()),
-            kv("mode", if self.mode == Mode::Curve { "curve".into() } else { "areas".into() }), kv("units", self.units.clone()),
+            kv("mode", if self.mode == Mode::Curve { "curve".into() } else { "areas".into() }), kv("units", self.units.clone()), kv("basis", if self.basis == Basis::Ms1 { "ms1".into() } else { "ms2".into() }),
             kv("align_on", self.align_on.to_string()), kv("align_max", self.align_max.to_string()), kv("align_ref", self.align_ref.to_string()),
         ]
     }
@@ -242,6 +322,7 @@ impl App {
                 "ratio_tol" => if let Ok(x) = v.parse() { self.ratio_tol = x },
                 "mode" => self.mode = if v == "areas" { Mode::Areas } else { Mode::Curve },
                 "units" => self.units = v.clone(),
+                "basis" => self.basis = if v == "ms1" { Basis::Ms1 } else { Basis::Ms2 },
                 "align_on" => if let Ok(x) = v.parse() { self.align_on = x },
                 "align_max" => if let Ok(x) = v.parse() { self.align_max = x },
                 "align_ref" => if let Ok(x) = v.parse() { self.align_ref = x },
@@ -273,6 +354,7 @@ impl App {
         self.anchor = self.sel_s;
         self.rows_dirty = true;
         self.editing = false;
+        self.pinned_scan = None;
         self.recompute_all();
         self.fix_selection();
     }
@@ -344,6 +426,7 @@ impl App {
         if i >= self.samples.len() { return; }
         self.push_undo("remove file");
         let s = self.samples.remove(i);
+        self.pinned_scan = None;
         self.audit.log("DATA_REMOVED", &format!("{} sha256={} (file on disk untouched)", s.data.name, s.data.sha256));
         if self.align_ref > i { self.align_ref -= 1; } else if self.align_ref == i { self.align_ref = 0; }
         self.fix_selection();
@@ -464,12 +547,15 @@ impl App {
     // ---------------- computation ----------------
     fn recompute_sample(&mut self, s: usize) {
         let (na, rt_win, baseline) = (self.analytes.len(), self.rt_win, self.baseline);
-        let tols: Vec<Vec<f64>> = self.analytes.iter().map(|a| a.ions.iter().map(|&m| self.tol_da(m)).collect()).collect();
+        let basis = self.basis;
+        let traces: Vec<Vec<f64>> = (0..na).map(|a| self.trace_mz(a)).collect();
+        let tols: Vec<Vec<f64>> = traces.iter().map(|v| v.iter().map(|&m| self.tol_da(m)).collect()).collect();
         let sm = &mut self.samples[s];
         let shift = sm.rt_shift;
-        sm.xics = self.analytes.iter().enumerate()
-            .map(|(ai, an)| an.ions.iter().enumerate().map(|(ii, &mz)| {
-                let mut x = xic(&sm.data.spectra, mz, tols[ai][ii]);
+        sm.xics = traces.iter().enumerate()
+            .map(|(ai, mzs)| mzs.iter().enumerate().map(|(ii, &mz)| {
+                let sp: &[Spectrum] = if basis == Basis::Ms1 { &sm.data.ms1 } else { &sm.data.spectra };
+                let mut x = xic(sp, mz, tols[ai][ii]);
                 if shift != 0.0 { for p in x.iter_mut() { p[0] += shift; } }
                 x
             }).collect()).collect();
@@ -491,14 +577,17 @@ impl App {
         let na = self.analytes.len();
         if a >= na { return; }
         let (rt_win, baseline) = (self.rt_win, self.baseline);
-        let tols: Vec<f64> = self.analytes[a].ions.iter().map(|&m| self.tol_da(m)).collect();
+        let basis = self.basis;
+        let mzs = self.trace_mz(a);
+        let tols: Vec<f64> = mzs.iter().map(|&m| self.tol_da(m)).collect();
         for s in 0..self.samples.len() {
             let sm = &mut self.samples[s];
             if sm.xics.len() < na { sm.xics.resize(na, vec![]); }
             if sm.cells.len() < na { sm.cells.resize_with(na, Cell::new); }
             let shift = sm.rt_shift;
-            sm.xics[a] = self.analytes[a].ions.iter().enumerate().map(|(ii, &mz)| {
-                let mut x = xic(&sm.data.spectra, mz, tols[ii]);
+            sm.xics[a] = mzs.iter().enumerate().map(|(ii, &mz)| {
+                let sp: &[Spectrum] = if basis == Basis::Ms1 { &sm.data.ms1 } else { &sm.data.spectra };
+                let mut x = xic(sp, mz, tols[ii]);
                 if shift != 0.0 { for p in x.iter_mut() { p[0] += shift; } }
                 x
             }).collect();
@@ -644,6 +733,7 @@ impl App {
         let mut o = String::new();
         o += &format!("# LC-MS/MS Quant v{} export {} user={}\n", VERSION, iso_now(), self.audit.user);
         o += &format!("# quantification={}\n", if curve { "standard curve" } else { "integrated areas only (arbitrary units)" });
+        o += &format!("# quantified_signal={}\n", if self.basis == Basis::Ms1 { "MS1 precursor area" } else { "MS2 product-ion area" });
         o += &format!("# tol={}{} rt_window_min={} weighting={} baseline_subtraction={} ion_ratio_tol_pct={} conc_units={}\n",
             self.tol, if self.tol_ppm { "ppm" } else { "Da" }, self.rt_win, WEIGHTS[self.weighting as usize], self.baseline, self.ratio_tol, self.units);
         o += &format!("# rt_alignment_on_import={} max_shift_min={} reference={}\n", self.align_on, self.align_max,
@@ -686,6 +776,7 @@ impl App {
         self.rows = self.analytes.iter().map(|a| [
             a.name.clone(),
             a.rt.map(|v| v.to_string()).unwrap_or_else(|| "n/a".into()),
+            a.precursor.map(|v| v.to_string()).unwrap_or_else(|| "n/a".into()),
             a.ions.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("; "),
         ]).collect();
         self.rows_dirty = false;
@@ -706,7 +797,7 @@ impl App {
     fn add_target(&mut self) {
         self.push_undo("add target");
         let n = self.analytes.len();
-        self.analytes.push(Analyte { name: format!("Target {}", n + 1), rt: None, ions: vec![100.0] });
+        self.analytes.push(Analyte { name: format!("Target {}", n + 1), rt: None, ions: vec![100.0], precursor: None });
         self.fits.push(None);
         self.recompute_analyte(n);
         self.rows_dirty = true;
@@ -730,8 +821,9 @@ impl App {
     fn targets_csv(&self) -> String {
         let mut o = String::from("name,rt_min,ions\n");
         for a in &self.analytes {
-            o += &format!("{},{},{}\n", csv(&a.name), a.rt.map(|v| v.to_string()).unwrap_or_else(|| "n/a".into()),
-                a.ions.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(";"));
+            let mut ions = a.ions.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(";");
+            if let Some(p) = a.precursor { ions += &format!(";p:{}", p); }
+            o += &format!("{},{},{}\n", csv(&a.name), a.rt.map(|v| v.to_string()).unwrap_or_else(|| "n/a".into()), ions);
         }
         o
     }
@@ -846,25 +938,34 @@ impl App {
     }
 
     // ---------------- UI ----------------
-    /// Selected target, all ions, in file `s`, with draggable integration boundaries.
+    /// Selected target, all traces, in file `s`, with draggable integration boundaries and hover read-out.
     fn ui_plot(&mut self, ui: &mut egui::Ui, s: usize) {
         let a = self.sel_a;
         let mut grab = self.grab;
         let mut edit: Option<(f64, f64)> = None;
         let mut stopped = false;
+        let clicked;
+        let mut hover: Option<Hover> = None;
+        let tmz = self.trace_mz(a);
         {
             let sm = &self.samples[s];
             let c = &sm.cells[a];
-            let an = &self.analytes[a];
             let norm = self.normalize;
-            let nmax: Vec<f64> = sm.xics[a].iter().map(|x| x.iter().fold(0.0f64, |m, p| m.max(p[1]))).collect();
-            sciplot!(Plot::new("xic").height(300.0).allow_drag(false).allow_boxed_zoom(false)
-                .legend(Legend::default()).x_axis_label("Retention time (min)  |  drag a green/red boundary line"))
+            let level: u8 = if self.basis == Basis::Ms1 { 1 } else { 2 };
+            let series: Vec<Series> = sm.xics[a].iter().enumerate().map(|(i, x)| {
+                let mx = x.iter().fold(0.0f64, |m, p| m.max(p[1]));
+                let d = format!("m/z {}", sci_prec(tmz[i], 9));
+                Series { name: d.clone(), data: x.clone(), ci: i, cur: false, file: s, level, fname: sm.data.name.clone(),
+                         desc: format!("{} · {}", self.analytes[a].name, d), scale: if norm && mx > 0.0 { 1.0 / mx } else { 1.0 } }
+            }).collect();
+            let scan_of = |f: usize, l: u8, j: usize| -> u32 {
+                let d = &self.samples[f].data;
+                if l == 1 { d.ms1.get(j).map(|x| x.scan).unwrap_or(0) } else { d.spectra.get(j).map(|x| x.scan).unwrap_or(0) }
+            };
+            let pr = rtplot!(Plot::new("xic").height(300.0).allow_drag(false).allow_boxed_zoom(false)
+                .legend(Legend::default()).x_axis_label("Retention time (min)  |  drag a green/red boundary line, click = pin the scan"))
                 .show(ui, |pu| {
-                    for (i, x) in sm.xics[a].iter().enumerate() {
-                        let d: Vec<[f64; 2]> = if norm && nmax[i] > 0.0 { x.iter().map(|p| [p[0], p[1] / nmax[i]]).collect() } else { x.clone() };
-                        pu.line(Line::new(PlotPoints::from(d)).name(format!("m/z {}", sci(an.ions[i]))).color(pal(i)));
-                    }
+                    draw_series!(pu, &series, hover, scan_of);
                     if c.found && !norm {
                         pu.polygon(Polygon::new(PlotPoints::from(shade(&sm.xics[a][0], c.start, c.end)))
                             .fill_color(Color32::from_rgba_unmultiplied(31, 119, 180, 60)).name("integrated"));
@@ -888,6 +989,11 @@ impl App {
                     }
                     if r.drag_stopped() { stopped = true; }
                 });
+            clicked = pr.response.clicked();
+        }
+        if let Some(h) = &hover {
+            self.hover = Some((h.file, h.rt));
+            if clicked { self.pin_scan(h.file, h.rt); }
         }
         if let Some((st, en)) = edit { self.apply_edit(s, a, st, en); }
         if stopped { self.commit(s, a); grab = None; }
@@ -898,9 +1004,9 @@ impl App {
         ui.horizontal(|ui| {
             if found {
                 ui.label("Start (min)");
-                let r1 = ui.add(dv(&mut st).speed(0.001));
+                let r1 = ui.add(dv_rt(&mut st).speed(0.01));
                 ui.label("End (min)");
-                let r2 = ui.add(dv(&mut en).speed(0.001));
+                let r2 = ui.add(dv_rt(&mut en).speed(0.01));
                 changed = r1.changed() || r2.changed();
                 done = r1.drag_stopped() || r1.lost_focus() || r2.drag_stopped() || r2.lost_focus();
             } else if ui.button("No peak found - define manually").clicked() {
@@ -924,7 +1030,7 @@ impl App {
         if c.found {
             let mut t = String::new();
             for (i, ar) in c.areas.iter().enumerate() {
-                t += &format!("ion {} (m/z {}): area {}   ", i + 1, sci(self.analytes[a].ions[i]), sci(*ar));
+                t += &format!("{} {} (m/z {}): area {}   ", if self.basis == Basis::Ms1 { "precursor" } else { "ion" }, i + 1, sci_prec(tmz[i], 9), sci(*ar));
                 if i > 0 && c.areas[0] > 0.0 { t += &format!("[ratio {}]   ", sci(ar / c.areas[0])); }
             }
             ui.monospace(t);
@@ -944,20 +1050,27 @@ impl App {
         let a = self.sel_a;
         let norm = self.normalize;
         let shown = self.shown();
-        let mut series: Vec<(String, Vec<[f64; 2]>, usize, bool)> = vec![];
+        let level: u8 = if self.basis == Basis::Ms1 { 1 } else { 2 };
+        let mut series: Vec<Series> = vec![];
         match (self.view, self.scope) {
             (View::Xic, Scope::AllTargets) => {
                 if let Some(s) = cur {
                     let sm = &self.samples[s];
                     for (ai, an) in self.analytes.iter().enumerate() {
-                        if let Some(x) = sm.xics.get(ai).and_then(|v| v.first()) { series.push((an.name.clone(), x.clone(), ai, false)); }
+                        if let Some(x) = sm.xics.get(ai).and_then(|v| v.first()) {
+                            let desc = format!("{} · m/z {}", an.name, sci_prec(self.trace_mz(ai)[0], 9));
+                            series.push(Series { name: an.name.clone(), data: x.clone(), ci: ai, cur: false, file: s, level, fname: sm.data.name.clone(), desc, scale: 1.0 });
+                        }
                     }
                 }
             }
             (View::Xic, _) => {
+                let desc = format!("{} · m/z {}", self.analytes[a].name, sci_prec(self.trace_mz(a)[0], 9));
                 for &f in &shown {
                     let sm = &self.samples[f];
-                    if let Some(x) = sm.xics.get(a).and_then(|v| v.first()) { series.push((sm.data.name.clone(), x.clone(), f, Some(f) == cur)); }
+                    if let Some(x) = sm.xics.get(a).and_then(|v| v.first()) {
+                        series.push(Series { name: sm.data.name.clone(), data: x.clone(), ci: f, cur: Some(f) == cur, file: f, level, fname: sm.data.name.clone(), desc: desc.clone(), scale: 1.0 });
+                    }
                 }
             }
             (v, _) => {
@@ -966,11 +1079,12 @@ impl App {
                     let sm = &self.samples[f];
                     let sh = sm.rt_shift;
                     let d: Vec<[f64; 2]> = chrom(&sm.data, self.tic_level, bpc).iter().map(|p| [p[0] + sh, p[1]]).collect();
-                    series.push((sm.data.name.clone(), d, f, Some(f) == cur));
+                    series.push(Series { name: sm.data.name.clone(), data: d, ci: f, cur: Some(f) == cur, file: f, level: self.tic_level, fname: sm.data.name.clone(),
+                                         desc: format!("{} (MS{})", if bpc { "BPC" } else { "TIC" }, self.tic_level), scale: 1.0 });
                 }
             }
         }
-        series.retain(|x| !x.1.is_empty());
+        series.retain(|x| !x.data.is_empty());
         if shown.is_empty() { ui.label("No file selected."); return; }
         if series.is_empty() {
             ui.label(if self.view == View::Xic { "No chromatogram data." } else { "The selected file(s) have no scans at this MS level." });
@@ -978,22 +1092,31 @@ impl App {
         }
         if norm {
             for sr in series.iter_mut() {
-                let m = sr.1.iter().fold(0.0f64, |m, p| m.max(p[1]));
-                if m > 0.0 { for p in sr.1.iter_mut() { p[1] /= m; } }
+                let m = sr.data.iter().fold(0.0f64, |m, p| m.max(p[1]));
+                if m > 0.0 { sr.scale = 1.0 / m; }
             }
         }
         let rt_hint = if self.view == View::Xic && !self.analytes.is_empty() { self.analytes[a].rt } else { None };
         let id = (self.view as u8, self.scope as u8, self.tic_level);
-        sciplot!(Plot::new(id).height(380.0).legend(Legend::default()).x_axis_label("Retention time (min)")
-            .y_axis_label(if norm { "Relative intensity" } else { "Intensity" }))
-            .show(ui, |pu| {
-                for (name, data, ci, is_cur) in series {
-                    let mut l = Line::new(PlotPoints::from(data)).name(name).color(pal(ci));
-                    if is_cur { l = l.width(2.5_f32); }
-                    pu.line(l);
-                }
-                if let Some(h) = rt_hint { pu.vline(VLine::new(h).color(Color32::GRAY).name("expected RT")); }
-            });
+        let mut hover: Option<Hover> = None;
+        let clicked;
+        {
+            let scan_of = |f: usize, l: u8, j: usize| -> u32 {
+                let d = &self.samples[f].data;
+                if l == 1 { d.ms1.get(j).map(|x| x.scan).unwrap_or(0) } else { d.spectra.get(j).map(|x| x.scan).unwrap_or(0) }
+            };
+            let pr = rtplot!(Plot::new(id).height(380.0).legend(Legend::default()).x_axis_label("Retention time (min)  |  click = pin the nearest MS2 scan")
+                .y_axis_label(if norm { "Relative intensity" } else { "Intensity" }))
+                .show(ui, |pu| {
+                    draw_series!(pu, &series, hover, scan_of);
+                    if let Some(h) = rt_hint { pu.vline(VLine::new(h).color(Color32::GRAY).name("expected RT")); }
+                });
+            clicked = pr.response.clicked();
+        }
+        if let Some(h) = &hover {
+            self.hover = Some((h.file, h.rt));
+            if clicked { self.pin_scan(h.file, h.rt); }
+        }
     }
 
     fn ui_shift(&mut self, ui: &mut egui::Ui, s: usize) {
@@ -1001,7 +1124,7 @@ impl App {
         let mut commit = false;
         ui.horizontal(|ui| {
             ui.label(format!("RT shift for {} (min):", self.samples[s].data.name));
-            let r = ui.add(dv(&mut v).speed(0.005));
+            let r = ui.add(dv_rt(&mut v).speed(0.01));
             commit = r.drag_stopped() || r.lost_focus();
             ui.weak("applies to all chromatograms of this file; resets its manual integrations");
         });
@@ -1024,7 +1147,7 @@ impl App {
                     if ui.selectable_label(self.sel_a == a, &self.analytes[a].name).clicked() { self.sel_a = a; }
                     match cur.and_then(|s| self.samples[s].cells.get(a)) {
                         Some(c) => {
-                            ui.label(sci(c.start)); ui.label(sci(c.end));
+                            ui.label(format!("{:.2}", c.start)); ui.label(format!("{:.2}", c.end));
                             ui.label(sci(c.areas.first().copied().unwrap_or(0.0)));
                             if curve { ui.label(cur.and_then(|s| self.conc_of(s, a)).map(sci).unwrap_or_else(|| "-".into())); }
                             ui.label(cur.map(|s| self.flags(s, a)).unwrap_or_default());
@@ -1190,35 +1313,57 @@ impl App {
         }
     }
 
+    fn fit_cols(&mut self, avail: f32) {
+        let w = (avail - 28.0 - 4.0 * 6.0 - 130.0).max(260.0);
+        self.col_w = [w * 0.22, w * 0.10, w * 0.14, w * 0.54];
+    }
+
     fn ui_targets_window(&mut self, ctx: &egui::Context) {
         if !self.show_targets { return; }
         let mut open = true;
-        let (mut commit, mut delete, mut add, mut save, mut save_as, mut open_t) = (None, None, false, false, false, false);
-        egui::Window::new("Target table (live editable)").open(&mut open).default_size([820.0, 440.0]).show(ctx, |ui| {
+        let (mut commit, mut delete): (Option<usize>, Option<usize>) = (None, None);
+        let (mut add, mut save, mut save_as, mut open_t) = (false, false, false, false);
+        egui::Window::new("Target table (live editable)").open(&mut open).default_size([1000.0, 440.0]).resizable(true).show(ctx, |ui| {
             if self.rows_dirty || self.rows.len() != self.analytes.len() { self.sync_rows(); }
+            let avail = ui.available_width();
+            if self.col_w[0] < 1.0 { self.fit_cols(avail); }
             ui.horizontal(|ui| {
                 if ui.button("Add target").clicked() { add = true; }
                 if ui.button("Open…").clicked() { open_t = true; }
                 if ui.button("Save").clicked() { save = true; }
                 if ui.button("Save as…").clicked() { save_as = true; }
+                if ui.button("Fit columns to window").clicked() { self.fit_cols(avail); }
                 ui.weak(match &self.table_path { Some(p) => p.display().to_string(), None => "(not saved yet)".into() });
             });
-            ui.weak("Edit name, RT (min or n/a) and ion m/z values (separated by ; or space). Changes apply when you leave a field and re-integrate immediately.");
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                egui::Grid::new("targets").striped(true).show(ui, |ui| {
-                    ui.strong("#"); ui.strong("Name"); ui.strong("RT (min)"); ui.strong("Ion m/z values"); ui.strong(""); ui.strong("");
-                    ui.end_row();
-                    for i in 0..self.rows.len() {
-                        ui.label((i + 1).to_string());
-                        let r0 = ui.add(egui::TextEdit::singleline(&mut self.rows[i][0]).desired_width(180.0));
-                        let r1 = ui.add(egui::TextEdit::singleline(&mut self.rows[i][1]).desired_width(70.0));
-                        let r2 = ui.add(egui::TextEdit::singleline(&mut self.rows[i][2]).desired_width(280.0));
-                        if r0.lost_focus() || r1.lost_focus() || r2.lost_focus() { commit = Some(i); }
-                        if parse_row(&self.rows[i]).is_none() { ui.colored_label(Color32::RED, "invalid"); } else { ui.label(""); }
-                        if ui.small_button("Delete").clicked() { delete = Some(i); }
-                        ui.end_row();
+            ui.weak("Drag the column borders to resize; the window scrolls sideways if needed. Changes apply when you leave a field and re-integrate immediately. Precursor m/z is only needed for MS1 quantification.");
+            egui::ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 0.0;
+                    ui.add_sized([28.0, 18.0], egui::Label::new(RichText::new("#").strong()));
+                    let heads = ["Name", "RT (min)", "Precursor m/z (MS1)", "Product ion m/z (MS2), separated by ;"];
+                    for k in 0..4 {
+                        ui.add_sized([self.col_w[k], 18.0], egui::Label::new(RichText::new(heads[k]).strong()));
+                        let (rect, resp) = ui.allocate_exact_size(egui::vec2(6.0, 18.0), egui::Sense::drag());
+                        ui.painter().vline(rect.center().x, rect.y_range(), ui.visuals().widgets.noninteractive.bg_stroke);
+                        if resp.hovered() || resp.dragged() { ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeHorizontal); }
+                        if resp.dragged() { self.col_w[k] = (self.col_w[k] + resp.drag_delta().x).max(40.0); }
                     }
                 });
+                for i in 0..self.rows.len() {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 0.0;
+                        ui.add_sized([28.0, 20.0], egui::Label::new((i + 1).to_string()));
+                        for k in 0..4 {
+                            let w = self.col_w[k];
+                            let r = ui.add_sized([w, 20.0], egui::TextEdit::singleline(&mut self.rows[i][k]));
+                            if r.lost_focus() { commit = Some(i); }
+                            ui.add_space(6.0);
+                        }
+                        if parse_row(&self.rows[i]).is_none() { ui.colored_label(Color32::RED, "invalid"); }
+                        ui.add_space(8.0);
+                        if ui.small_button("Delete").clicked() { delete = Some(i); }
+                    });
+                }
             });
         });
         self.show_targets = open;
@@ -1275,6 +1420,7 @@ impl App {
                 if ui.selectable_label(self.tab == Tab::Chrom, "Chromatograms").clicked() { self.tab = Tab::Chrom; ui.close_menu(); }
                 if ui.selectable_label(self.tab == Tab::Matrix, "Results matrix (all files)").clicked() { self.tab = Tab::Matrix; ui.close_menu(); }
                 ui.separator();
+                ui.checkbox(&mut self.show_spectrum, "MS2 spectrum panel");
                 if ui.button("Audit trail").clicked() { self.show_audit = true; ui.close_menu(); }
             });
             ui.menu_button("Analysis", |ui| {
@@ -1284,6 +1430,9 @@ impl App {
                 ui.separator();
                 if ui.selectable_label(self.mode == Mode::Curve, "Quantify with standard curve").clicked() { self.mode = Mode::Curve; ui.close_menu(); }
                 if ui.selectable_label(self.mode == Mode::Areas, "Report integrated areas only").clicked() { self.mode = Mode::Areas; ui.close_menu(); }
+                ui.separator();
+                if ui.selectable_label(self.basis == Basis::Ms2, "Quantify on MS2 product-ion area").clicked() { self.set_basis(Basis::Ms2); ui.close_menu(); }
+                if ui.selectable_label(self.basis == Basis::Ms1, "Quantify on MS1 precursor area").clicked() { self.set_basis(Basis::Ms1); ui.close_menu(); }
                 ui.separator();
                 if ui.button("Verify audit trail integrity").clicked() {
                     self.status = match audit::verify(&self.audit.path) {
@@ -1327,6 +1476,117 @@ impl App {
         if save { self.save_project(false); }
         if open { self.open_project_dialog(ctx); }
         if new { self.new_project(); }
+    }
+}
+
+impl App {
+    /// m/z values traced for target `a`: the product ions (MS2 basis) or the precursor (MS1 basis).
+    fn trace_mz(&self, a: usize) -> Vec<f64> {
+        match self.basis {
+            Basis::Ms2 => self.analytes[a].ions.clone(),
+            Basis::Ms1 => vec![self.analytes[a].precursor.unwrap_or(0.0)],
+        }
+    }
+
+    fn set_basis(&mut self, b: Basis) {
+        if self.basis == b { return; }
+        self.push_undo("quantification signal");
+        self.basis = b;
+        self.audit.log("QUANT_BASIS", if b == Basis::Ms1 { "MS1 precursor area" } else { "MS2 product-ion area" });
+        self.recompute_all();
+        if b == Basis::Ms1 && self.analytes.iter().any(|a| a.precursor.is_none()) {
+            self.status = "Some targets have no precursor m/z (add p:<m/z> in the table); they cannot be quantified on the MS1 signal.".into();
+        }
+    }
+
+    /// MS2 scan (index into `spectra`) closest in time to `rt` (aligned minutes) in file `f`.
+    fn nearest_ms2(&self, f: usize, rt: f64) -> Option<usize> {
+        let sm = self.samples.get(f)?;
+        let sp = &sm.data.spectra;
+        if sp.is_empty() { return None; }
+        let t = rt - sm.rt_shift;
+        let j = sp.partition_point(|x| x.rt < t);
+        let (c0, c1) = (j.saturating_sub(1), j.min(sp.len() - 1));
+        Some(if (sp[c1].rt - t).abs() < (sp[c0].rt - t).abs() { c1 } else { c0 })
+    }
+
+    /// MS2 scan inside the integration window with the strongest quantifier product ion.
+    fn apex_scan(&self, s: usize, a: usize) -> Option<usize> {
+        let sm = self.samples.get(s)?;
+        let c = sm.cells.get(a)?;
+        if !c.found { return None; }
+        let ion = *self.analytes.get(a)?.ions.first()?;
+        let tol = self.tol_da(ion);
+        let (t0, t1) = (c.start - sm.rt_shift, c.end - sm.rt_shift);
+        let sp = &sm.data.spectra;
+        let (mut best, mut top) = (None, 0.0f64);
+        for j in sp.partition_point(|x| x.rt < t0)..sp.len() {
+            if sp[j].rt > t1 { break; }
+            let v = intensity_near(&sp[j].mz, &sp[j].inten, ion, tol);
+            if v > top { top = v; best = Some(j); }
+        }
+        best
+    }
+
+    fn pin_scan(&mut self, f: usize, rt: f64) {
+        if let Some(i) = self.nearest_ms2(f, rt) { self.pinned_scan = Some((f, i)); }
+    }
+
+    /// Which MS2 scan the spectrum panel shows: hovered > pinned > apex of the selected target in the current file.
+    fn spectrum_pick(&self) -> Option<(usize, usize, &'static str)> {
+        if self.follow_hover {
+            if let Some((f, rt)) = self.hover { if let Some(i) = self.nearest_ms2(f, rt) { return Some((f, i, "hovered")); } }
+        }
+        if let Some((f, i)) = self.pinned_scan {
+            if f < self.samples.len() && i < self.samples[f].data.spectra.len() { return Some((f, i, "pinned")); }
+        }
+        let s = self.cur()?;
+        if self.sel_a < self.analytes.len() { return self.apex_scan(s, self.sel_a).map(|i| (s, i, "apex of the selected target")); }
+        None
+    }
+
+    /// Second graph: MS2 spectrum of the selected target (stems; target product ions highlighted).
+    fn ui_spectrum(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("MS2 spectrum");
+            ui.checkbox(&mut self.follow_hover, "follow chromatogram hover");
+            ui.checkbox(&mut self.spec_autofit, "auto-fit view");
+            if self.pinned_scan.is_some() && ui.button("Unpin scan").clicked() { self.pinned_scan = None; }
+            ui.weak("click the chromatogram to pin the nearest MS2 scan");
+        });
+        let (f, i, why) = match self.spectrum_pick() {
+            Some(x) => x,
+            None => { ui.label("No MS2 scan to show: select a file and a target with a detected peak, or hover / click the chromatogram."); return; }
+        };
+        let sm = &self.samples[f];
+        let sp = &sm.data.spectra[i];
+        let norm = self.normalize;
+        let mx = sp.inten.iter().cloned().fold(0.0f32, f32::max) as f64;
+        let scale = if norm && mx > 0.0 { 1.0 / mx } else { 1.0 };
+        ui.label(format!("{} · MS2 scan {} · RT {:.2} min · {} peaks · shown: {}", sm.data.name, sp.scan, sp.rt + sm.rt_shift, sp.mz.len(), why));
+        let mut all: Vec<[f64; 2]> = Vec::with_capacity(sp.mz.len() * 3);
+        for (m, y) in sp.mz.iter().zip(sp.inten.iter()) { let y = *y as f64 * scale; all.push([*m, 0.0]); all.push([*m, y]); all.push([*m, 0.0]); }
+        let mut hl: Vec<(usize, f64, Vec<[f64; 2]>)> = vec![];
+        if self.sel_a < self.analytes.len() {
+            for (k, &ion) in self.analytes[self.sel_a].ions.iter().enumerate() {
+                let tol = self.tol_da(ion);
+                let mut v = vec![];
+                for (m, y) in sp.mz.iter().zip(sp.inten.iter()) {
+                    if (*m - ion).abs() <= tol { let y = *y as f64 * scale; v.push([*m, 0.0]); v.push([*m, y]); v.push([*m, 0.0]); }
+                }
+                hl.push((k, ion, v));
+            }
+        }
+        let mut plot = sciplot!(Plot::new("spec").height(ui.available_height()).legend(Legend::default()).x_axis_label("m/z")
+            .y_axis_label(if norm { "Relative intensity" } else { "Intensity" }));
+        if self.spec_autofit { plot = plot.reset(); }
+        plot.show(ui, |pu| {
+            pu.line(Line::new(PlotPoints::from(all)).color(Color32::GRAY).name("peaks"));
+            for (k, ion, v) in hl {
+                pu.vline(VLine::new(ion).color(pal(k).gamma_multiply(0.5)));
+                if !v.is_empty() { pu.line(Line::new(PlotPoints::from(v)).color(pal(k)).width(2.5_f32).name(format!("target ion m/z {}", sci_prec(ion, 9)))); }
+            }
+        });
     }
 }
 
@@ -1397,7 +1657,7 @@ impl eframe::App for App {
                 ui.label("m/z tol ±");
                 ch |= ui.add(dv(&mut self.tol).speed(0.1).range(0.001..=1000.0)).changed();
                 ui.label("RT window ± (min)");
-                ch |= ui.add(dv(&mut self.rt_win).speed(0.01).range(0.01..=60.0)).changed();
+                ch |= ui.add(dv_rt(&mut self.rt_win).speed(0.01).range(0.01..=60.0)).changed();
                 ui.label("Weighting");
                 egui::ComboBox::new("wt", "").selected_text(WEIGHTS[self.weighting as usize]).show_ui(ui, |ui| {
                     for (i, w) in WEIGHTS.iter().enumerate() { ch |= ui.selectable_value(&mut self.weighting, i as u8, *w).changed(); }
@@ -1419,10 +1679,17 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.mode, Mode::Curve, "Standard curve");
                 });
                 if self.mode != before { self.audit.log("QUANT_MODE", if self.mode == Mode::Areas { "integrated areas only" } else { "standard curve" }); }
+                ui.label("Signal:");
+                let mut nb = self.basis;
+                egui::ComboBox::new("basis", "").selected_text(if self.basis == Basis::Ms2 { "MS2 product-ion area" } else { "MS1 precursor area" }).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut nb, Basis::Ms2, "MS2 product-ion area");
+                    ui.selectable_value(&mut nb, Basis::Ms1, "MS1 precursor area");
+                });
+                if nb != self.basis { self.set_basis(nb); }
                 ui.separator();
                 if ui.checkbox(&mut self.align_on, "Align RT on import").changed() { self.audit.log("ALIGN_SETTING", &format!("align_on_import={}", self.align_on)); }
                 ui.label("max shift ±(min)");
-                ui.add(dv(&mut self.align_max).speed(0.05).range(0.1..=10.0));
+                ui.add(dv_rt(&mut self.align_max).speed(0.05).range(0.1..=10.0));
                 ui.label("reference:");
                 egui::ComboBox::new("aref", "")
                     .selected_text(self.samples.get(self.align_ref).map(|s| s.data.name.clone()).unwrap_or_else(|| "-".into()))
@@ -1464,7 +1731,7 @@ impl eframe::App for App {
                             for k in Kind::ALL { changed |= ui.selectable_value(&mut s.kind, k, k.label()).changed(); }
                         });
                         if self.mode == Mode::Curve && s.kind == Kind::Standard { changed |= ui.add(dv(&mut s.conc).speed(0.1).range(0.0..=1e9)).changed(); }
-                        if s.rt_shift != 0.0 { ui.weak(format!("Δ{} min", sci(s.rt_shift))); }
+                        if s.rt_shift != 0.0 { ui.weak(format!("Δ{:+.2} min", s.rt_shift)); }
                     });
                 }
             });
@@ -1484,6 +1751,10 @@ impl eframe::App for App {
             if let Some(i) = remove { self.remove_sample(i); }
         });
 
+        if self.show_spectrum && self.tab == Tab::Chrom && !self.samples.is_empty() {
+            egui::TopBottomPanel::bottom("spectrum").resizable(true).default_height(270.0).min_height(120.0).show(ctx, |ui| { self.ui_spectrum(ui); });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.samples.is_empty() {
                 ui.heading("Drop Thermo .raw files (and optionally a .csv target table: name, RT|n/a, ion m/z values) onto this window.");
@@ -1495,7 +1766,10 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.tab, Tab::Matrix, "Results matrix (all files)");
             });
             ui.separator();
+            let prev_hover = self.hover;
+            self.hover = None;
             match self.tab { Tab::Chrom => self.ui_chrom(ui), Tab::Matrix => self.ui_matrix(ui) }
+            if self.hover != prev_hover { ui.ctx().request_repaint(); }
         });
 
         self.ui_targets_window(ctx);
@@ -1607,11 +1881,11 @@ mod tests {
         let first = a.samples[0].cells[0].areas[0];
         assert!(first > 0.0);
         a.sync_rows();
-        a.rows[0][2] = "400".into(); // constant 10-count ion: different area
+        a.rows[0][3] = "400".into(); // constant 10-count ion: different area
         a.apply_row(0);
         assert_eq!(a.analytes[0].ions, vec![400.0]);
         assert!((a.samples[0].cells[0].areas[0] - first).abs() > 1.0);
-        a.rows[0][2] = "".into(); // invalid: must not be applied
+        a.rows[0][3] = "".into(); // invalid: must not be applied
         a.apply_row(0);
         assert_eq!(a.analytes[0].ions, vec![400.0]);
         a.add_target();
@@ -1649,11 +1923,17 @@ mod tests {
         let mut a = app();
         targets(&mut a);
         add(&mut a, 0, 0.0, 2.0);
-        let c = &a.samples[0].cells[0];
-        assert!(c.found);
+        assert!(a.samples[0].cells[0].found);
         let expect = testkit::expected_area_seconds(2.0);
-        assert!((c.areas[0] - expect).abs() / expect < 0.05, "area {} vs {}", c.areas[0], expect);
+        let with_baseline = a.samples[0].cells[0].areas[0];
+        // Without baseline subtraction only the tails beyond the automatic window (5 % of the apex) are missing.
+        a.baseline = false;
+        a.recompute_all();
+        let c = &a.samples[0].cells[0];
+        assert!((c.areas[0] - expect).abs() / expect < 0.03, "area {} vs {}", c.areas[0], expect);
         assert!((c.areas[1] / c.areas[0] - 0.5).abs() < 0.01);
+        // With baseline subtraction the 5 % pedestal at the window edges is removed as well: lower, but not by much.
+        assert!(with_baseline < c.areas[0] && with_baseline > 0.8 * expect, "{} vs {}", with_baseline, expect);
     }
 
     #[test]
@@ -1698,5 +1978,65 @@ mod tests {
         a.commit(0, 0);
         assert!(a.audit.recent.iter().any(|l| l.contains("MANUAL_INTEGRATION") && l.contains("reason=test")));
         assert!(audit::verify(&a.audit.path).is_ok());
+    }
+
+    #[test]
+    fn ms1_basis_quantifies_the_precursor_signal() {
+        let mut a = app();
+        a.analytes = parse_table("name,rt,ions\nSynth,5.0,150;250;p:500\n").unwrap();
+        a.recompute_all();
+        add(&mut a, 0, 0.0, 1.0);
+        let ms2 = a.samples[0].cells[0].areas[0];
+        assert_eq!(a.samples[0].xics[0].len(), 2);
+        a.set_basis(Basis::Ms1);
+        assert_eq!(a.samples[0].xics[0].len(), 1, "one precursor trace");
+        let ms1 = a.samples[0].cells[0].areas[0];
+        let expect = 50000.0 * 0.1 * (2.0 * std::f64::consts::PI).sqrt() * 60.0;
+        assert!((ms1 - expect).abs() / expect < 0.15, "MS1 area {} vs {}", ms1, expect);
+        assert!((ms1 - ms2).abs() > 1.0, "the two signals are different measurements");
+        a.undo();
+        assert!(a.basis == Basis::Ms2);
+        assert_eq!(a.samples[0].xics[0].len(), 2);
+    }
+
+    #[test]
+    fn target_without_precursor_gives_no_peak_on_ms1_basis() {
+        let mut a = app();
+        targets(&mut a);
+        add(&mut a, 0, 0.0, 1.0);
+        a.set_basis(Basis::Ms1);
+        assert!(!a.samples[0].cells[0].found);
+        assert!(a.status.contains("precursor"));
+    }
+
+    #[test]
+    fn hover_picks_the_nearest_trace_and_point() {
+        let mk = |name: &str, y: f64, ci: usize| Series {
+            name: name.into(), data: (0..100).map(|i| [i as f64 * 0.1, y]).collect(), ci, cur: false, file: 0, level: 2,
+            fname: "f".into(), desc: name.into(), scale: 1.0,
+        };
+        let s = vec![mk("low", 10.0, 0), mk("high", 1000.0, 1)];
+        let h = nearest_hover(&s, 5.04, 900.0, 10.0).unwrap();
+        assert_eq!((h.desc.as_str(), h.idx), ("high", 50));
+        assert_eq!(nearest_hover(&s, 5.04, 20.0, 10.0).unwrap().desc, "low");
+        assert!(nearest_hover(&s, 50.0, 10.0, 10.0).is_none(), "cursor far outside the data");
+    }
+
+    #[test]
+    fn spectrum_panel_scan_selection() {
+        let mut a = app();
+        targets(&mut a);
+        add(&mut a, 0, 0.0, 1.0);
+        let i = a.apex_scan(0, 0).expect("apex scan");
+        assert!((a.samples[0].data.spectra[i].rt - 5.0).abs() < 0.02);
+        assert!(matches!(a.spectrum_pick(), Some((0, _, "apex of the selected target"))));
+        let j = a.nearest_ms2(0, 5.0).unwrap();
+        assert!((a.samples[0].data.spectra[j].rt - 5.0).abs() <= 0.005 + 1e-9);
+        a.pin_scan(0, 7.0);
+        assert!(matches!(a.spectrum_pick(), Some((0, _, "pinned"))));
+        a.hover = Some((0, 2.0));
+        assert!(matches!(a.spectrum_pick(), Some((0, _, "hovered"))));
+        a.follow_hover = false;
+        assert!(matches!(a.spectrum_pick(), Some((0, _, "pinned"))));
     }
 }

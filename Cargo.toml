@@ -1,6 +1,6 @@
 [package]
 name = "lcms-quant"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Targeted LC-MS/MS quantification from Thermo .raw files"
 license = "MIT"
