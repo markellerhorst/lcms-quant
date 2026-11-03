@@ -2060,7 +2060,7 @@ mod tests {
         a.trfp_path.clear();
         a
     }
-    fn info(n: usize) -> LoadInfo { LoadInfo { path: format!("synthetic{}.raw", n), raw_sha: "0".repeat(64), detail: String::new() } }
+    fn info(n: usize) -> LoadInfo { LoadInfo { path: format!("synthetic{}.raw", n), raw_sha: "0".repeat(64), detail: String::new(), source: RawSource::Disk(std::path::PathBuf::new()) } }
     fn add(a: &mut App, n: usize, offset: f64, scale: f64) {
         let d = mzml::parse_bytes(&format!("run{}.raw", n), &testkit::synthetic_mzml(offset, scale)).expect("synthetic mzML parses");
         a.add_sample(d, info(n));
