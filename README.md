@@ -26,7 +26,7 @@ Requirements: [Rust](https://rustup.rs) (stable); on Windows additionally the *V
 "Desktop development with C++" workload; on macOS the Xcode command-line tools.
 
 ```powershell
-git clone <your-repo-url>
+git clone https://github.com/markellerhorst/lcms-quant
 cd lcms-quant
 cargo run --release          # or: cargo build --release  -> target/release/lcms-quant(.exe)
 ```
