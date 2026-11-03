@@ -8,6 +8,12 @@ fn sup(n: i32) -> String {
     s
 }
 
+/// m/z values: four decimals, plain notation: 286.14384 -> "286.1438".
+pub fn mz4(x: f64) -> String { format!("{:.4}", x) }
+
+/// Percent axis labels: 40.0 -> "40%".
+pub fn pct0(x: f64) -> String { format!("{:.0}%", x) }
+
 /// Retention time in minutes, two decimals: 7.2 -> "7.20".
 pub fn rt2(x: f64) -> String { format!("{:.2}", x) }
 

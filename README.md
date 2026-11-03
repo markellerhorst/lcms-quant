@@ -17,7 +17,9 @@ reports either **integrated areas (arbitrary units)** or **concentrations from a
 - Retention-time alignment (global shift by TIC cross-correlation), TIC / BPC / XIC inspection of one or many files
 - Hover read-out on every chromatogram (m/z, RT, scan number, intensity of the nearest point) and a linked **MS2 spectrum panel** (hovered / pinned / apex scan, target ions highlighted)
 - Explorer-style multi-select (Ctrl / Shift), right-click to remove a file from the project (never deletes it on disk)
-- Projects (`.quant`), undo/redo (10 steps), scientific-notation display, zoom with Ctrl +/-/0, user name in the audit trail
+- Projects (`.quant`) that **contain the raw files** (optional, on by default), undo/redo (10 steps), zoom with Ctrl +/-/0, user name in the audit trail
+- Numbers in scientific notation (`10²`), except retention times (`7.20` min) and m/z values (`286.1438`); normalised views show 0–100 %
+- Right-click any chromatogram or MS2 spectrum → save as **PNG** or **SVG**
 
 ## Build
 Requirements: [Rust](https://rustup.rs) (stable); on Windows additionally the *Visual Studio Build Tools* with the
@@ -41,7 +43,13 @@ cargo run --release          # or: cargo build --release  -> target/release/lcms
    `Morphine,n/a,286.14;201.07;165.05;p:286.1438`. The precursor is only needed for MS1-based quantification. Mark calibration files as **Standard** and enter their concentrations.
 2. Choose the signal (MS2 product ions or MS1 precursor) in the top bar. Check/adjust the integrated peaks; drag the green/red lines.
    Give a reason for manual changes. Hover the chromatogram to see m/z, RT and scan; click it to pin the nearest MS2 scan in the spectrum panel.
-3. Export the results (`Export CSV`), save the project (`Ctrl+S`).
+3. Export the results (`Export CSV`), save the project (`Ctrl+S`). A project embeds the original `.raw` files, so it can be opened on another PC
+   (it needs ThermoRawFileParser there). While opening, each embedded file is copied to a temporary file for the converter and deleted again
+   immediately; the data itself stays in memory. Untick *File → Embed raw files when saving projects* to save only references + SHA-256.
+
+## Project file size
+A `.quant` project that embeds its raw files is as large as the raw files together (often several GB). Saving runs in the background and
+streams the data, so it does not need that much memory. Projects from older versions (without embedded files) can still be opened.
 
 ## Memory note
 MS1 spectra are kept in memory (needed for MS1-based quantification), so each imported file needs roughly 50–300 MB depending on scan count and peak density.

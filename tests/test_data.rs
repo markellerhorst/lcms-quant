@@ -110,7 +110,7 @@ fn project_file_can_reference_the_real_files() {
         app_version: "test".into(), user: "N/A".into(), params: vec![],
         analytes: vec![Analyte { name: "T".into(), rt: None, ions: vec![100.0], precursor: Some(250.5) }],
         samples: raws.iter().map(|p| SampleRec {
-            path: p.to_string_lossy().to_string(), raw_sha256: rawconv::hash_file(p).unwrap(), kind: "Unknown".into(), conc: 0.0, rt_shift: 0.0, show: true, cells: vec![],
+            path: p.to_string_lossy().to_string(), raw_sha256: rawconv::hash_file(p).unwrap(), kind: "Unknown".into(), conc: 0.0, rt_shift: 0.0, show: true, embedded: false, cells: vec![],
         }).collect(),
     };
     let back = ProjectFile::parse(&pf.to_text()).unwrap();

@@ -1,6 +1,6 @@
 //! Unit/integration tests for the non-GUI core. Run: cargo test
 use lcms_quant::{
-    audit, fmt::{parse_sci, rt2, sci, sci_prec}, history::History, icon, inflate::zlib_decompress, mzml, project::*, quant::*, sha256::*, testkit,
+    audit, fmt::{mz4, parse_sci, pct0, rt2, sci, sci_prec}, png, svg, history::History, icon, inflate::zlib_decompress, mzml, project::*, quant::*, sha256::*, testkit,
 };
 
 // ---------- hashing ----------
@@ -70,6 +70,11 @@ fn retention_times_use_two_decimals_and_mz_keeps_its_digits() {
     assert_eq!(rt2(12.3456), "12.35");
     assert_eq!(sci_prec(286.1438, 9), "2.861438×10²");
     assert_eq!(sci_prec(150.0, 9), "1.5×10²");
+    assert_eq!(mz4(286.14384), "286.1438");
+    assert_eq!(mz4(150.0), "150.0000");
+    assert_eq!(mz4(1234.56789), "1234.5679", "plain rounding, never scientific notation");
+    assert_eq!(pct0(40.0), "40%");
+    assert_eq!(pct0(100.0), "100%");
 }
 
 // ---------- undo/redo ----------
@@ -236,7 +241,7 @@ fn project_file_round_trip() {
         params: vec![("tol".into(), "10".into()), ("mode".into(), "curve".into())],
         analytes: vec![Analyte { name: "A".into(), rt: None, ions: vec![100.5, 200.25], precursor: Some(286.1438) }, Analyte { name: "B".into(), rt: Some(3.25), ions: vec![300.0], precursor: None }],
         samples: vec![SampleRec {
-            path: r"C:\data\a b.raw".into(), raw_sha256: "ab".repeat(32), kind: "Standard".into(), conc: 0.1, rt_shift: -0.0123, show: true,
+            path: r"C:\data\a b.raw".into(), raw_sha256: "ab".repeat(32), kind: "Standard".into(), conc: 0.1, rt_shift: -0.0123, show: true, embedded: true,
             cells: vec![CellRec { analyte: 0, found: true, manual: true, start: 1.0 / 3.0, end: 2.5, include: false },
                         CellRec { analyte: 1, found: false, manual: false, start: 0.0, end: 0.0, include: true }],
         }],
@@ -298,4 +303,142 @@ fn the_real_app_icon_decodes_when_present() {
             None => eprintln!("NOTE: {} uses an ICO sub-format the built-in decoder does not support (window icon is skipped, exe icon still embedded)", p.display()),
         }
     } else { eprintln!("SKIPPED: {} not found", p.display()); }
+}
+
+// ---------- project container with embedded raw files ----------
+use lcms_quant::project::{extract_blob, read_container, write_container, BlobSource};
+
+fn tmp_dir(name: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!("lcmsq_{}_{}", std::process::id(), name));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+fn sample(path: &str) -> SampleRec {
+    SampleRec { path: path.into(), raw_sha256: String::new(), kind: "Unknown".into(), conc: 0.0, rt_shift: 0.0, show: true, embedded: false, cells: vec![] }
+}
+
+#[test]
+fn project_container_embeds_raw_files_and_extracts_them_bit_exact() {
+    let dir = tmp_dir("container");
+    let big: Vec<u8> = (0..2_500_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+    let small = b"tiny raw file".to_vec();
+    let (a, b) = (dir.join("a.raw"), dir.join("b.raw"));
+    std::fs::write(&a, &big).unwrap();
+    std::fs::write(&b, &small).unwrap();
+    let pf = ProjectFile { app_version: "t".into(), user: "u".into(), params: vec![], analytes: vec![],
+                           samples: vec![sample(&a.to_string_lossy()), sample("C:\\gone\\missing.raw"), sample(&b.to_string_lossy())] };
+    let out = dir.join("p.quant");
+    let offs = write_container(&out, &pf, &[Some(BlobSource::File(a.clone())), None, Some(BlobSource::File(b.clone()))]).unwrap();
+    assert!(offs[1].is_none());
+
+    let (back, offs2) = read_container(&out).unwrap();
+    assert_eq!(offs, offs2);
+    assert_eq!(back.samples.iter().map(|s| s.embedded).collect::<Vec<_>>(), vec![true, false, true]);
+
+    let dest = dir.join("x.raw");
+    let (o, l) = offs2[0].unwrap();
+    let h = extract_blob(&out, o, l, &dest).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), big);
+    assert_eq!(h, sha256_hex(&big));
+    let (o2, l2) = offs2[2].unwrap();
+    extract_blob(&out, o2, l2, &dest).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), small);
+
+    // the original files vanish; saving again over the SAME project must keep the data (read from the old copy, written to a temp file)
+    std::fs::remove_file(&a).unwrap();
+    std::fs::remove_file(&b).unwrap();
+    let blobs = vec![
+        Some(BlobSource::Range { path: out.clone(), offset: o, len: l }), None,
+        Some(BlobSource::Range { path: out.clone(), offset: o2, len: l2 }),
+    ];
+    let offs3 = write_container(&out, &back, &blobs).unwrap();
+    let (_, offs4) = read_container(&out).unwrap();
+    assert_eq!(offs3, offs4);
+    let (o, l) = offs4[0].unwrap();
+    extract_blob(&out, o, l, &dest).unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), big);
+    assert!(!dir.join("p.quant.tmp").exists(), "temporary file is renamed away");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn old_text_only_projects_still_open() {
+    let dir = tmp_dir("legacy");
+    let pf = ProjectFile { samples: vec![sample("x.raw")], ..Default::default() };
+    let old = pf.to_text().replace("\ttrue\tfalse\n", "\ttrue\n"); // strip the 'embedded' column an old version did not write
+    let p = dir.join("old.quant");
+    std::fs::write(&p, old).unwrap();
+    let (back, offs) = read_container(&p).unwrap();
+    assert_eq!(back.samples.len(), 1);
+    assert_eq!(offs, vec![None]);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn truncated_container_is_rejected() {
+    let dir = tmp_dir("trunc");
+    let raw = dir.join("a.raw");
+    std::fs::write(&raw, vec![7u8; 100_000]).unwrap();
+    let pf = ProjectFile { samples: vec![sample("a.raw")], ..Default::default() };
+    let out = dir.join("p.quant");
+    write_container(&out, &pf, &[Some(BlobSource::File(raw))]).unwrap();
+    let bytes = std::fs::read(&out).unwrap();
+    std::fs::write(&out, &bytes[..bytes.len() - 5000]).unwrap();
+    assert!(read_container(&out).is_err());
+    std::fs::write(&out, b"LCMSQNT2\xff\xff\xff\xff\xff\xff\xff\x7f").unwrap();
+    assert!(read_container(&out).is_err(), "absurd text length");
+    assert!(write_container(&dir.join("q.quant"), &pf, &[]).is_err(), "blob list must match the samples");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- PNG / SVG figure export ----------
+#[test]
+fn crc32_matches_the_standard_check_values() {
+    assert_eq!(png::crc32(b"123456789"), 0xCBF43926);
+    assert_eq!(png::crc32(b"IEND"), 0xAE426082, "CRC of the PNG IEND chunk");
+}
+
+#[test]
+fn png_encoder_round_trips_through_the_decoder() {
+    let (w, h) = (300u32, 200u32); // > 65535 bytes of pixel data: several stored blocks
+    let rgb: Vec<u8> = (0..(w * h * 3)).map(|i| (i % 251) as u8).collect();
+    let bytes = png::encode_rgb(w, h, &rgb).unwrap();
+    assert_eq!(&bytes[..8], &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+    assert_eq!(&bytes[bytes.len() - 8..bytes.len() - 4], b"IEND");
+    let (rgba, dw, dh) = icon::decode_png(&bytes).unwrap();
+    assert_eq!((dw, dh), (w, h));
+    for (px, orig) in rgba.chunks(4).zip(rgb.chunks(3)) { assert_eq!(&px[..3], orig); assert_eq!(px[3], 255); }
+    assert!(png::encode_rgb(2, 2, &[0; 5]).is_err());
+}
+
+#[test]
+fn svg_ticks_are_nice_numbers() {
+    assert_eq!(svg::nice_ticks(0.0, 100.0, 5), vec![0.0, 20.0, 40.0, 60.0, 80.0, 100.0]);
+    let t = svg::nice_ticks(4.93, 5.07, 5);
+    assert!(t.iter().any(|v| (v - 5.0).abs() < 1e-9));
+    assert!(t.iter().all(|v| *v >= 4.93 - 1e-9 && *v <= 5.07 + 1e-9));
+    assert_eq!(svg::nice_ticks(1.0, 1.0, 5), vec![1.0]);
+}
+
+#[test]
+fn svg_export_contains_axes_series_and_escapes_text() {
+    let plot = svg::SvgPlot {
+        title: "run <1> & \"x\"".into(), x_label: "Retention time (min)".into(), y_label: "Intensity (% of maximum)".into(),
+        series: vec![
+            svg::SvgSeries { name: "m/z 150.0000".into(), rgb: (31, 119, 180), width: 2.0, points: vec![[7.0, 0.0], [7.2, 100.0], [7.4, 0.0]] },
+            svg::SvgSeries { name: "empty".into(), rgb: (0, 0, 0), width: 1.0, points: vec![] },
+        ],
+        vlines: vec![svg::SvgVLine { x: 7.2, rgb: (0, 100, 0), label: "start".into() }],
+        bounds: [7.0, 7.4, 0.0, 100.0], x_fmt: rt2, y_fmt: pct0,
+    };
+    let s = svg::render(&plot);
+    assert!(s.starts_with("<svg ") && s.trim_end().ends_with("</svg>"));
+    assert_eq!(s.matches("<path ").count(), 1, "empty series are skipped");
+    assert!(s.contains("run &lt;1&gt; &amp; &quot;x&quot;"));
+    assert!(s.contains(">7.20<"), "retention-time tick with two decimals");
+    assert!(s.contains(">100%<") && s.contains(">0%<"), "percent axis from 0 to 100");
+    assert!(s.contains("m/z 150.0000") && s.contains("clip-path"));
+    assert!(!s.contains("NaN"));
 }

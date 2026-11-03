@@ -1,9 +1,11 @@
 use crate::{
     audit::{self, iso_now, Audit},
-    fmt::{parse_sci, sci, sci_prec},
+    fmt::{mz4, parse_sci, pct0, rt2, sci},
     history::History,
     mzml::{self, MzData, Spectrum},
-    project::{CellRec, ProjectFile, SampleRec},
+    png,
+    project::{self, BlobSource, CellRec, ProjectFile, RawSource, SampleRec},
+    svg::{self, SvgPlot, SvgSeries, SvgVLine},
     quant::*,
     rawconv,
 };
@@ -32,39 +34,90 @@ macro_rules! sciplot {
     };
 }
 
-/// Chromatogram plots: retention-time axis with two decimals, other axes in scientific notation, no default cursor label.
+/// Chromatogram plots: retention-time axis with two decimals; y axis in scientific notation, or 0-100 % when normalised.
 macro_rules! rtplot {
-    ($p:expr) => {
-        $p.x_axis_formatter(|m, _| format!("{:.2}", m.value))
-            .y_axis_formatter(|m, _| sci(m.value))
+    ($p:expr, $norm:expr) => {{
+        let mut p = $p
+            .x_axis_formatter(|m, _| format!("{:.2}", m.value))
+            .y_axis_formatter(move |m, _| if $norm { pct0(m.value) } else { sci(m.value) })
             .show_x(false)
-            .show_y(false)
-    };
+            .show_y(false);
+        if $norm { p = p.include_y(0.0).include_y(100.0).set_margin_fraction(egui::vec2(0.0, 0.0)); }
+        p
+    }};
+}
+
+/// Spectrum plots: m/z with four decimals; y axis in scientific notation, or 0-100 % when normalised.
+macro_rules! mzplot {
+    ($p:expr, $norm:expr) => {{
+        let mut p = $p
+            .x_axis_formatter(|m, _| mz4(m.value))
+            .y_axis_formatter(move |m, _| if $norm { pct0(m.value) } else { sci(m.value) })
+            .label_formatter(move |name, v| {
+                let head = if name.is_empty() { String::new() } else { format!("{}\n", name) };
+                format!("{}m/z = {}\nintensity = {}", head, mz4(v.x), if $norm { pct0(v.y) } else { sci(v.y) })
+            });
+        if $norm { p = p.include_y(0.0).include_y(100.0).set_margin_fraction(egui::vec2(0.0, 0.0)); }
+        p
+    }};
 }
 
 /// Draws the traces, finds the point nearest to the cursor and annotates it with m/z, RT, scan number and intensity.
+/// `$cap`: true while a PNG capture is pending (no hover annotation in the picture).
 macro_rules! draw_series {
-    ($pu:ident, $series:expr, $hover:ident, $scan_of:ident) => {{
+    ($pu:ident, $series:expr, $hover:ident, $scan_of:ident, $cap:expr) => {{
         for s in $series.iter() {
             let d: Vec<[f64; 2]> = s.data.iter().map(|p| [p[0], p[1] * s.scale]).collect();
             let mut l = Line::new(PlotPoints::from(d)).name(s.name.clone()).color(pal(s.ci));
             if s.cur { l = l.width(2.5_f32); }
             $pu.line(l);
         }
-        if let Some(p) = $pu.pointer_coordinate() {
-            let b = $pu.plot_bounds();
-            $hover = nearest_hover($series, p.x, p.y, b.max()[0] - b.min()[0]);
+        if !$cap {
+            if let Some(p) = $pu.pointer_coordinate() {
+                let b = $pu.plot_bounds();
+                $hover = nearest_hover($series, p.x, p.y, b.max()[0] - b.min()[0]);
+            }
         }
         if let Some(h) = &$hover {
             let b = $pu.plot_bounds();
             let right = h.rt > (b.min()[0] + b.max()[0]) / 2.0;
-            let txt = format!("{}\n{}\nRT {:.2} min · scan {}\nintensity {}", h.fname, h.desc, h.rt, $scan_of(h.file, h.level, h.idx), sci(h.y));
+            let pct = if h.scale != 1.0 { format!(" ({:.1}%)", h.y * h.scale) } else { String::new() };
+            let txt = format!("{}\n{}\nRT {:.2} min · scan {}\nintensity {}{}", h.fname, h.desc, h.rt, $scan_of(h.file, h.level, h.idx), sci(h.y), pct);
             $pu.points(Points::new(vec![[h.rt, h.y * h.scale]]).radius(5.0_f32).color(Color32::WHITE));
             $pu.text(Text::new(PlotPoint::new(h.rt, h.y * h.scale),
                 RichText::new(txt).color(Color32::WHITE).background_color(Color32::from_black_alpha(200)))
                 .anchor(if right { egui::Align2::RIGHT_BOTTOM } else { egui::Align2::LEFT_BOTTOM }));
         }
     }};
+}
+
+/// Right-click menu of a plot: save as PNG or SVG.
+macro_rules! export_menu {
+    ($resp:expr, $what:expr, $out:ident) => {
+        $resp.context_menu(|ui| {
+            if ui.button(format!("Save {} as PNG…", $what)).clicked() { $out = Some(ExportKind::Png); ui.close_menu(); }
+            if ui.button(format!("Save {} as SVG…", $what)).clicked() { $out = Some(ExportKind::Svg); ui.close_menu(); }
+        })
+    };
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ExportKind { Png, Svg }
+
+/// A pending PNG capture of one plot (taken from the window screenshot after the context menu has closed).
+struct Capture { rect: egui::Rect, path: PathBuf, frames: u8, sent: bool }
+
+fn color_rgb(c: Color32) -> (u8, u8, u8) { (c.r(), c.g(), c.b()) }
+
+fn safe_name(s: &str) -> String {
+    s.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' }).collect()
+}
+
+fn svg_series(series: &[Series]) -> Vec<SvgSeries> {
+    series.iter().map(|s| SvgSeries {
+        name: s.name.clone(), rgb: color_rgb(pal(s.ci)), width: if s.cur { 2.5 } else { 1.5 },
+        points: s.data.iter().map(|p| [p[0], p[1] * s.scale]).collect(),
+    }).collect()
 }
 
 struct Series {
@@ -93,8 +146,13 @@ fn nearest_hover(series: &[Series], px: f64, py: f64, width: f64) -> Option<Hove
     best.map(|b| b.1)
 }
 
-struct LoadInfo { path: String, raw_sha: String, detail: String }
-enum Msg { Loaded(MzData, LoadInfo), Err(String), Finished }
+struct LoadInfo { path: String, raw_sha: String, detail: String, source: RawSource }
+enum Msg {
+    Loaded(MzData, LoadInfo),
+    Err(String),
+    Finished,
+    ProjectSaved { path: PathBuf, result: Result<Vec<Option<(u64, u64)>>, String>, src_paths: Vec<String>, missing: Vec<String> },
+}
 
 const CREDITS: &str = "Thermo .raw files are read through ThermoRawFileParser (CompOmics, Apache-2.0), run as an external program; nothing is bundled or linked: https://github.com/compomics/ThermoRawFileParser\n\
 Hulstaert N, Shofstahl J, Sachsenberg T, Walzer M, Barsnes H, Martens L, Perez-Riverol Y. J Proteome Res 2020;19:537-542 (doi:10.1021/acs.jproteome.9b00328).\n\
@@ -132,7 +190,7 @@ impl Cell {
 }
 
 struct Sample {
-    data: Arc<MzData>, src_path: String, raw_sha: String, kind: Kind, conc: f64,
+    data: Arc<MzData>, src_path: String, raw_sha: String, source: RawSource, kind: Kind, conc: f64,
     xics: Vec<Vec<Vec<[f64; 2]>>>, cells: Vec<Cell>,
     show: bool, rt_shift: f64, shift_ui: f64,
 }
@@ -140,7 +198,7 @@ struct Sample {
 /// Everything undo/redo needs. Raw data is shared (Arc), derived chromatograms are recomputed on restore.
 #[derive(Clone)]
 struct SampleState {
-    data: Arc<MzData>, src_path: String, raw_sha: String, kind: Kind, conc: f64,
+    data: Arc<MzData>, src_path: String, raw_sha: String, source: RawSource, kind: Kind, conc: f64,
     cells: Vec<Cell>, show: bool, rt_shift: f64,
 }
 #[derive(Clone)]
@@ -167,7 +225,6 @@ pub struct App {
     units: String,
     reason: String,
     settings_dirty: bool,
-    path_in: String,
     out_path: String,
     status: String,
     show_audit: bool,
@@ -208,6 +265,9 @@ pub struct App {
     pinned_scan: Option<(usize, usize)>,
     hover: Option<(usize, f64)>,
     col_w: [f32; 4],
+    embed_raw: bool,
+    saving: usize,
+    capture: Option<Capture>,
 }
 
 fn csv(s: &str) -> String {
@@ -264,7 +324,7 @@ impl App {
             analytes: vec![], samples: vec![], fits: vec![], sel_s: 0, sel_a: 0, anchor: 0,
             tol_ppm: true, tol: 10.0, rt_win: 0.3, weighting: 2, baseline: true, ratio_tol: 30.0,
             units: "ng/mL".into(), reason: String::new(), settings_dirty: false,
-            path_in: String::new(), out_path: "results.csv".into(),
+            out_path: "results.csv".into(),
             status: "Drop a .csv target table (optional) and Thermo .raw files onto the window, or use the File menu.".into(),
             show_audit: false, show_credits: false, show_readme: false, show_targets: false,
             grab: None, editing: false, audit: Audit::new(audit_path), user_logged: "N/A".into(), tx, rx, loading: 0,
@@ -274,8 +334,8 @@ impl App {
             history: History::new(MAX_UNDO), last_undo_label: String::new(),
             rows: vec![], rows_dirty: true, table_path: None, project_path: None, pending: None,
             zoom: 1.0, title: String::new(),
-            basis: Basis::Ms2, show_spectrum: true, spec_autofit: true, follow_hover: true, pinned_scan: None, hover: None,
-            col_w: [0.0; 4],
+            basis: Basis::Ms2, show_spectrum: true, spec_autofit: true, follow_hover: false, pinned_scan: None, hover: None,
+            col_w: [0.0; 4], embed_raw: true, saving: 0, capture: None,
         };
         app.load_settings();
         app
@@ -335,7 +395,7 @@ impl App {
         Snapshot {
             label: label.to_string(), analytes: self.analytes.clone(),
             samples: self.samples.iter().map(|s| SampleState {
-                data: s.data.clone(), src_path: s.src_path.clone(), raw_sha: s.raw_sha.clone(), kind: s.kind, conc: s.conc,
+                data: s.data.clone(), src_path: s.src_path.clone(), raw_sha: s.raw_sha.clone(), source: s.source.clone(), kind: s.kind, conc: s.conc,
                 cells: s.cells.clone(), show: s.show, rt_shift: s.rt_shift,
             }).collect(),
             sel_s: self.sel_s, sel_a: self.sel_a, params: self.params_vec(),
@@ -346,7 +406,7 @@ impl App {
         self.analytes = s.analytes;
         self.apply_params(&s.params);
         self.samples = s.samples.into_iter().map(|st| Sample {
-            data: st.data, src_path: st.src_path, raw_sha: st.raw_sha, kind: st.kind, conc: st.conc, xics: vec![], cells: st.cells,
+            data: st.data, src_path: st.src_path, raw_sha: st.raw_sha, source: st.source, kind: st.kind, conc: st.conc, xics: vec![], cells: st.cells,
             show: st.show, rt_shift: st.rt_shift, shift_ui: st.rt_shift,
         }).collect();
         self.sel_s = s.sel_s.min(self.samples.len().saturating_sub(1));
@@ -451,11 +511,47 @@ impl App {
                 Ok((h, c)) => {
                     let name = raw.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                     match mzml::parse_bytes(&name, &c.mzml) {
-                        Ok(d) => { let _ = tx.send(Msg::Loaded(d, LoadInfo { path: p, raw_sha: h, detail: c.detail })); }
+                        Ok(d) => { let _ = tx.send(Msg::Loaded(d, LoadInfo { path: p, raw_sha: h, detail: c.detail, source: RawSource::Disk(raw.clone()) })); }
                         Err(e) => { let _ = tx.send(Msg::Err(e)); }
                     }
                 }
                 Err(e) => { let _ = tx.send(Msg::Err(format!("{}: {}", p, e))); }
+            }
+            let _ = tx.send(Msg::Finished);
+            ctx.request_repaint();
+        });
+        true
+    }
+
+    /// Re-imports a raw file that is stored inside a project: it is copied to a temporary file (ThermoRawFileParser can only read
+    /// from a path), converted in memory, and the temporary copy is deleted again right away.
+    fn start_load_embedded(&mut self, ctx: &egui::Context, rec_path: String, project: PathBuf, offset: u64, len: u64) -> bool {
+        let trfp = match rawconv::find_trfp(&self.trfp_path) {
+            Some(p) => p,
+            None => { self.status = "ThermoRawFileParser not found: enter the path to ThermoRawFileParser.exe in the top bar.".into(); return false; }
+        };
+        self.loading += 1;
+        self.status = format!("Reading {} from the project...", rec_path);
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!("lcmsquant_{}_{}", std::process::id(), nanos));
+            let fname = Path::new(&rec_path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "embedded.raw".into());
+            let tmp = dir.join(&fname);
+            let res = std::fs::create_dir_all(&dir).map_err(|e| e.to_string())
+                .and_then(|_| project::extract_blob(&project, offset, len, &tmp))
+                .and_then(|h| rawconv::convert_in_memory(&trfp, &tmp).map(|c| (h, c)));
+            let _ = std::fs::remove_file(&tmp);
+            let _ = std::fs::remove_dir(&dir);
+            match res {
+                Ok((h, c)) => match mzml::parse_bytes(&fname, &c.mzml) {
+                    Ok(d) => {
+                        let detail = format!("embedded_in_project={} temp_copy_deleted=true {}", project.display(), c.detail);
+                        let _ = tx.send(Msg::Loaded(d, LoadInfo { path: rec_path, raw_sha: h, detail, source: RawSource::Embedded { project, offset, len } }));
+                    }
+                    Err(e) => { let _ = tx.send(Msg::Err(e)); }
+                },
+                Err(e) => { let _ = tx.send(Msg::Err(format!("{}: {}", rec_path, e))); }
             }
             let _ = tx.send(Msg::Finished);
             ctx.request_repaint();
@@ -503,7 +599,7 @@ impl App {
         if !in_project { self.push_undo("import file"); }
         let na = self.analytes.len();
         let mut sm = Sample {
-            data: Arc::new(d), src_path: info.path.clone(), raw_sha: info.raw_sha.clone(), kind: Kind::Unknown, conc: 0.0,
+            data: Arc::new(d), src_path: info.path.clone(), raw_sha: info.raw_sha.clone(), source: info.source.clone(), kind: Kind::Unknown, conc: 0.0,
             xics: vec![], cells: vec![], show: true, rt_shift: 0.0, shift_ui: 0.0,
         };
         if let Some(p) = self.pending.as_mut() {
@@ -858,13 +954,13 @@ impl App {
         ProjectFile {
             app_version: VERSION.into(), user: self.audit.user.clone(), params: self.params_vec(), analytes: self.analytes.clone(),
             samples: self.samples.iter().map(|s| SampleRec {
-                path: s.src_path.clone(), raw_sha256: s.raw_sha.clone(), kind: s.kind.label().into(), conc: s.conc, rt_shift: s.rt_shift, show: s.show,
+                path: s.src_path.clone(), raw_sha256: s.raw_sha.clone(), kind: s.kind.label().into(), conc: s.conc, rt_shift: s.rt_shift, show: s.show, embedded: false,
                 cells: s.cells.iter().enumerate().map(|(i, c)| CellRec { analyte: i, found: c.found, manual: c.manual, start: c.start, end: c.end, include: c.include }).collect(),
             }).collect(),
         }
     }
 
-    fn save_project(&mut self, force_dialog: bool) {
+    fn save_project(&mut self, ctx: &egui::Context, force_dialog: bool) {
         let path = match (&self.project_path, force_dialog) {
             (Some(p), false) => p.clone(),
             _ => match rfd::FileDialog::new().set_title("Save project").add_filter("LC-MS/MS Quant project", &["quant"]).set_file_name("project.quant").save_file() {
@@ -872,15 +968,28 @@ impl App {
                 None => return,
             },
         };
-        let text = self.project_file().to_text();
-        match std::fs::write(&path, &text) {
-            Ok(_) => {
-                self.audit.log("PROJECT_SAVED", &format!("{} sha256={}", path.display(), crate::sha256::sha256_hex(text.as_bytes())));
-                self.status = format!("Saved project {}", path.display());
-                self.project_path = Some(path);
-            }
-            Err(e) => self.status = format!("Save failed: {}", e),
+        let pf = self.project_file();
+        let mut blobs: Vec<Option<BlobSource>> = vec![];
+        let mut missing: Vec<String> = vec![];
+        for s in &self.samples {
+            let b = if !self.embed_raw { None } else {
+                match &s.source {
+                    RawSource::Disk(p) if p.is_file() => Some(BlobSource::File(p.clone())),
+                    RawSource::Embedded { project, offset, len } if project.is_file() => Some(BlobSource::Range { path: project.clone(), offset: *offset, len: *len }),
+                    _ => { missing.push(s.data.name.clone()); None }
+                }
+            };
+            blobs.push(b);
         }
+        let src_paths: Vec<String> = self.samples.iter().map(|s| s.src_path.clone()).collect();
+        self.saving += 1;
+        self.status = format!("Saving project {} ...", path.display());
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
+        std::thread::spawn(move || {
+            let result = project::write_container(&path, &pf, &blobs);
+            let _ = tx.send(Msg::ProjectSaved { path, result, src_paths, missing });
+            ctx.request_repaint();
+        });
     }
 
     fn open_project_dialog(&mut self, ctx: &egui::Context) {
@@ -888,10 +997,10 @@ impl App {
     }
 
     fn open_project(&mut self, ctx: &egui::Context, path: &Path) {
-        let text = match std::fs::read_to_string(path) { Ok(t) => t, Err(e) => { self.status = format!("{}: {}", path.display(), e); return; } };
-        let pf = match ProjectFile::parse(&text) { Ok(p) => p, Err(e) => { self.status = format!("Project error: {}", e); return; } };
+        let (pf, offs) = match project::read_container(path) { Ok(x) => x, Err(e) => { self.status = format!("Project error: {}", e); return; } };
         self.push_undo("open project");
-        self.audit.log("PROJECT_OPENED", &format!("{} sha256={} saved_by={}", path.display(), crate::sha256::sha256_hex(text.as_bytes()), pf.user));
+        self.audit.log("PROJECT_OPENED", &format!("{} text_sha256={} saved_by={} embedded_raw_files={}", path.display(),
+            crate::sha256::sha256_hex(pf.to_text().as_bytes()), pf.user, offs.iter().filter(|o| o.is_some()).count()));
         self.samples.clear();
         self.analytes = pf.analytes.clone();
         self.fits = vec![None; self.analytes.len()];
@@ -902,7 +1011,13 @@ impl App {
         if pf.samples.is_empty() { self.status = format!("Opened project {}", path.display()); return; }
         self.pending = Some(Pending { recs: pf.samples.clone(), mismatches: vec![] });
         let mut started = 0;
-        for rec in &pf.samples { if self.start_load(ctx, &rec.path) { started += 1; } }
+        for (rec, off) in pf.samples.iter().zip(offs.iter()) {
+            let ok = match off {
+                Some((o, l)) => self.start_load_embedded(ctx, rec.path.clone(), path.to_path_buf(), *o, *l),
+                None => self.start_load(ctx, &rec.path),
+            };
+            if ok { started += 1; }
+        }
         if started == 0 { self.pending = None; }
         else { self.status = format!("Opening project: re-importing {} raw file(s)...", started); }
     }
@@ -946,7 +1061,10 @@ impl App {
         let mut stopped = false;
         let clicked;
         let mut hover: Option<Hover> = None;
+        let mut ex: Option<ExportKind> = None;
+        let mut export_req: Option<(ExportKind, SvgPlot, egui::Rect)> = None;
         let tmz = self.trace_mz(a);
+        let capturing = self.capture.is_some();
         {
             let sm = &self.samples[s];
             let c = &sm.cells[a];
@@ -954,18 +1072,19 @@ impl App {
             let level: u8 = if self.basis == Basis::Ms1 { 1 } else { 2 };
             let series: Vec<Series> = sm.xics[a].iter().enumerate().map(|(i, x)| {
                 let mx = x.iter().fold(0.0f64, |m, p| m.max(p[1]));
-                let d = format!("m/z {}", sci_prec(tmz[i], 9));
+                let d = format!("m/z {}", mz4(tmz[i]));
                 Series { name: d.clone(), data: x.clone(), ci: i, cur: false, file: s, level, fname: sm.data.name.clone(),
-                         desc: format!("{} · {}", self.analytes[a].name, d), scale: if norm && mx > 0.0 { 1.0 / mx } else { 1.0 } }
+                         desc: format!("{} · {}", self.analytes[a].name, d), scale: if norm && mx > 0.0 { 100.0 / mx } else { 1.0 } }
             }).collect();
             let scan_of = |f: usize, l: u8, j: usize| -> u32 {
                 let d = &self.samples[f].data;
                 if l == 1 { d.ms1.get(j).map(|x| x.scan).unwrap_or(0) } else { d.spectra.get(j).map(|x| x.scan).unwrap_or(0) }
             };
             let pr = rtplot!(Plot::new("xic").height(300.0).allow_drag(false).allow_boxed_zoom(false)
-                .legend(Legend::default()).x_axis_label("Retention time (min)  |  drag a green/red boundary line, click = pin the scan"))
+                .legend(Legend::default()).x_axis_label("Retention time (min)  |  drag a green/red boundary line, click = pin the scan")
+                .y_axis_label(if norm { "Intensity (% of maximum)" } else { "Intensity" }), norm)
                 .show(ui, |pu| {
-                    draw_series!(pu, &series, hover, scan_of);
+                    draw_series!(pu, &series, hover, scan_of, capturing);
                     if c.found && !norm {
                         pu.polygon(Polygon::new(PlotPoints::from(shade(&sm.xics[a][0], c.start, c.end)))
                             .fill_color(Color32::from_rgba_unmultiplied(31, 119, 180, 60)).name("integrated"));
@@ -989,12 +1108,30 @@ impl App {
                     }
                     if r.drag_stopped() { stopped = true; }
                 });
-            clicked = pr.response.clicked();
+            clicked = pr.response.clicked() && !capturing;
+            let rect = pr.response.rect;
+            let (x0, x1, y0, y1) = { let b = pr.transform.bounds(); (b.min()[0], b.max()[0], b.min()[1], b.max()[1]) };
+            export_menu!(pr.response, "chromatogram", ex);
+            if let Some(k) = ex {
+                let mut vl = vec![];
+                if c.found {
+                    vl.push(SvgVLine { x: c.start, rgb: (0, 100, 0), label: "integration start".into() });
+                    vl.push(SvgVLine { x: c.end, rgb: (139, 0, 0), label: "integration end".into() });
+                }
+                let yf: fn(f64) -> String = if norm { pct0 } else { sci };
+                export_req = Some((k, SvgPlot {
+                    title: format!("{} · {}", sm.data.name, self.analytes[a].name),
+                    x_label: "Retention time (min)".into(),
+                    y_label: if norm { "Intensity (% of maximum)".into() } else { "Intensity".into() },
+                    series: svg_series(&series), vlines: vl, bounds: [x0, x1, y0, y1], x_fmt: rt2, y_fmt: yf,
+                }, rect));
+            }
         }
         if let Some(h) = &hover {
             self.hover = Some((h.file, h.rt));
             if clicked { self.pin_scan(h.file, h.rt); }
         }
+        if let Some((k, plot, rect)) = export_req { let stem = safe_name(&plot.title); self.do_export(k, plot, rect, &stem); }
         if let Some((st, en)) = edit { self.apply_edit(s, a, st, en); }
         if stopped { self.commit(s, a); grab = None; }
         self.grab = grab;
@@ -1030,7 +1167,7 @@ impl App {
         if c.found {
             let mut t = String::new();
             for (i, ar) in c.areas.iter().enumerate() {
-                t += &format!("{} {} (m/z {}): area {}   ", if self.basis == Basis::Ms1 { "precursor" } else { "ion" }, i + 1, sci_prec(tmz[i], 9), sci(*ar));
+                t += &format!("{} {} (m/z {}): area {}   ", if self.basis == Basis::Ms1 { "precursor" } else { "ion" }, i + 1, mz4(tmz[i]), sci(*ar));
                 if i > 0 && c.areas[0] > 0.0 { t += &format!("[ratio {}]   ", sci(ar / c.areas[0])); }
             }
             ui.monospace(t);
@@ -1058,14 +1195,14 @@ impl App {
                     let sm = &self.samples[s];
                     for (ai, an) in self.analytes.iter().enumerate() {
                         if let Some(x) = sm.xics.get(ai).and_then(|v| v.first()) {
-                            let desc = format!("{} · m/z {}", an.name, sci_prec(self.trace_mz(ai)[0], 9));
+                            let desc = format!("{} · m/z {}", an.name, mz4(self.trace_mz(ai)[0]));
                             series.push(Series { name: an.name.clone(), data: x.clone(), ci: ai, cur: false, file: s, level, fname: sm.data.name.clone(), desc, scale: 1.0 });
                         }
                     }
                 }
             }
             (View::Xic, _) => {
-                let desc = format!("{} · m/z {}", self.analytes[a].name, sci_prec(self.trace_mz(a)[0], 9));
+                let desc = format!("{} · m/z {}", self.analytes[a].name, mz4(self.trace_mz(a)[0]));
                 for &f in &shown {
                     let sm = &self.samples[f];
                     if let Some(x) = sm.xics.get(a).and_then(|v| v.first()) {
@@ -1093,30 +1230,52 @@ impl App {
         if norm {
             for sr in series.iter_mut() {
                 let m = sr.data.iter().fold(0.0f64, |m, p| m.max(p[1]));
-                if m > 0.0 { sr.scale = 1.0 / m; }
+                if m > 0.0 { sr.scale = 100.0 / m; }
             }
         }
         let rt_hint = if self.view == View::Xic && !self.analytes.is_empty() { self.analytes[a].rt } else { None };
         let id = (self.view as u8, self.scope as u8, self.tic_level);
         let mut hover: Option<Hover> = None;
         let clicked;
+        let mut ex: Option<ExportKind> = None;
+        let mut export_req: Option<(ExportKind, SvgPlot, egui::Rect)> = None;
+        let capturing = self.capture.is_some();
         {
             let scan_of = |f: usize, l: u8, j: usize| -> u32 {
                 let d = &self.samples[f].data;
                 if l == 1 { d.ms1.get(j).map(|x| x.scan).unwrap_or(0) } else { d.spectra.get(j).map(|x| x.scan).unwrap_or(0) }
             };
             let pr = rtplot!(Plot::new(id).height(380.0).legend(Legend::default()).x_axis_label("Retention time (min)  |  click = pin the nearest MS2 scan")
-                .y_axis_label(if norm { "Relative intensity" } else { "Intensity" }))
+                .y_axis_label(if norm { "Intensity (% of maximum)" } else { "Intensity" }), norm)
                 .show(ui, |pu| {
-                    draw_series!(pu, &series, hover, scan_of);
+                    draw_series!(pu, &series, hover, scan_of, capturing);
                     if let Some(h) = rt_hint { pu.vline(VLine::new(h).color(Color32::GRAY).name("expected RT")); }
                 });
-            clicked = pr.response.clicked();
+            clicked = pr.response.clicked() && !capturing;
+            let rect = pr.response.rect;
+            let (x0, x1, y0, y1) = { let b = pr.transform.bounds(); (b.min()[0], b.max()[0], b.min()[1], b.max()[1]) };
+            export_menu!(pr.response, "chromatogram", ex);
+            if let Some(k) = ex {
+                let title = match self.view {
+                    View::Xic => if self.scope == Scope::AllTargets { "Extracted ion chromatograms (quantifier ions of all targets)".to_string() }
+                                 else { format!("Extracted ion chromatogram · {}", self.analytes[a].name) },
+                    View::Tic => format!("Total ion chromatogram (MS{})", self.tic_level),
+                    View::Bpc => format!("Base peak chromatogram (MS{})", self.tic_level),
+                };
+                let yf: fn(f64) -> String = if norm { pct0 } else { sci };
+                let vl: Vec<SvgVLine> = rt_hint.map(|h| SvgVLine { x: h, rgb: (128, 128, 128), label: "expected RT".into() }).into_iter().collect();
+                export_req = Some((k, SvgPlot {
+                    title, x_label: "Retention time (min)".into(),
+                    y_label: if norm { "Intensity (% of maximum)".into() } else { "Intensity".into() },
+                    series: svg_series(&series), vlines: vl, bounds: [x0, x1, y0, y1], x_fmt: rt2, y_fmt: yf,
+                }, rect));
+            }
         }
         if let Some(h) = &hover {
             self.hover = Some((h.file, h.rt));
             if clicked { self.pin_scan(h.file, h.rt); }
         }
+        if let Some((k, plot, rect)) = export_req { let stem = safe_name(&plot.title); self.do_export(k, plot, rect, &stem); }
     }
 
     fn ui_shift(&mut self, ui: &mut egui::Ui, s: usize) {
@@ -1382,8 +1541,9 @@ impl App {
             ui.menu_button("File", |ui| {
                 if ui.add(egui::Button::new("New project").shortcut_text("Ctrl+N")).clicked() { self.new_project(); ui.close_menu(); }
                 if ui.add(egui::Button::new("Open project…").shortcut_text("Ctrl+O")).clicked() { self.open_project_dialog(ctx); ui.close_menu(); }
-                if ui.add(egui::Button::new("Save project").shortcut_text("Ctrl+S")).clicked() { self.save_project(false); ui.close_menu(); }
-                if ui.button("Save project as…").clicked() { self.save_project(true); ui.close_menu(); }
+                if ui.add(egui::Button::new("Save project").shortcut_text("Ctrl+S")).clicked() { self.save_project(ctx, false); ui.close_menu(); }
+                if ui.button("Save project as…").clicked() { self.save_project(ctx, true); ui.close_menu(); }
+                ui.checkbox(&mut self.embed_raw, "Embed raw files when saving projects");
                 ui.separator();
                 if ui.button("Import Thermo .raw files…").clicked() {
                     if let Some(files) = rfd::FileDialog::new().set_title("Import Thermo .raw files").add_filter("Thermo RAW", &["raw"]).pick_files() {
@@ -1473,7 +1633,7 @@ impl App {
         ));
         if redo { self.redo(); }
         if undo { self.undo(); }
-        if save { self.save_project(false); }
+        if save { self.save_project(ctx, false); }
         if open { self.open_project_dialog(ctx); }
         if new { self.new_project(); }
     }
@@ -1552,18 +1712,19 @@ impl App {
             ui.checkbox(&mut self.follow_hover, "follow chromatogram hover");
             ui.checkbox(&mut self.spec_autofit, "auto-fit view");
             if self.pinned_scan.is_some() && ui.button("Unpin scan").clicked() { self.pinned_scan = None; }
-            ui.weak("click the chromatogram to pin the nearest MS2 scan");
+            ui.weak("click the chromatogram to pin the nearest MS2 scan · right-click a plot to save it");
         });
         let (f, i, why) = match self.spectrum_pick() {
             Some(x) => x,
-            None => { ui.label("No MS2 scan to show: select a file and a target with a detected peak, or hover / click the chromatogram."); return; }
+            None => { ui.label("No MS2 scan to show: select a file and a target with a detected peak, or click the chromatogram to pin a scan."); return; }
         };
         let sm = &self.samples[f];
         let sp = &sm.data.spectra[i];
         let norm = self.normalize;
         let mx = sp.inten.iter().cloned().fold(0.0f32, f32::max) as f64;
-        let scale = if norm && mx > 0.0 { 1.0 / mx } else { 1.0 };
-        ui.label(format!("{} · MS2 scan {} · RT {:.2} min · {} peaks · shown: {}", sm.data.name, sp.scan, sp.rt + sm.rt_shift, sp.mz.len(), why));
+        let scale = if norm && mx > 0.0 { 100.0 / mx } else { 1.0 };
+        let head = format!("{} · MS2 scan {} · RT {:.2} min · {} peaks · shown: {}", sm.data.name, sp.scan, sp.rt + sm.rt_shift, sp.mz.len(), why);
+        ui.label(&head);
         let mut all: Vec<[f64; 2]> = Vec::with_capacity(sp.mz.len() * 3);
         for (m, y) in sp.mz.iter().zip(sp.inten.iter()) { let y = *y as f64 * scale; all.push([*m, 0.0]); all.push([*m, y]); all.push([*m, 0.0]); }
         let mut hl: Vec<(usize, f64, Vec<[f64; 2]>)> = vec![];
@@ -1577,16 +1738,71 @@ impl App {
                 hl.push((k, ion, v));
             }
         }
-        let mut plot = sciplot!(Plot::new("spec").height(ui.available_height()).legend(Legend::default()).x_axis_label("m/z")
-            .y_axis_label(if norm { "Relative intensity" } else { "Intensity" }));
+        let mut plot = mzplot!(Plot::new("spec").height(ui.available_height()).legend(Legend::default()).x_axis_label("m/z")
+            .y_axis_label(if norm { "Intensity (% of maximum)" } else { "Intensity" }), norm);
         if self.spec_autofit { plot = plot.reset(); }
-        plot.show(ui, |pu| {
-            pu.line(Line::new(PlotPoints::from(all)).color(Color32::GRAY).name("peaks"));
-            for (k, ion, v) in hl {
-                pu.vline(VLine::new(ion).color(pal(k).gamma_multiply(0.5)));
-                if !v.is_empty() { pu.line(Line::new(PlotPoints::from(v)).color(pal(k)).width(2.5_f32).name(format!("target ion m/z {}", sci_prec(ion, 9)))); }
+        let pr = plot.show(ui, |pu| {
+            pu.line(Line::new(PlotPoints::from(all.clone())).color(Color32::GRAY).name("peaks"));
+            for (k, ion, v) in &hl {
+                pu.vline(VLine::new(*ion).color(pal(*k).gamma_multiply(0.5)));
+                if !v.is_empty() { pu.line(Line::new(PlotPoints::from(v.clone())).color(pal(*k)).width(2.5_f32).name(format!("target ion m/z {}", mz4(*ion)))); }
             }
         });
+        let rect = pr.response.rect;
+        let (x0, x1, y0, y1) = { let b = pr.transform.bounds(); (b.min()[0], b.max()[0], b.min()[1], b.max()[1]) };
+        let mut ex: Option<ExportKind> = None;
+        export_menu!(pr.response, "MS2 spectrum", ex);
+        if let Some(k) = ex {
+            let mut ss = vec![SvgSeries { name: "peaks".into(), rgb: (128, 128, 128), width: 1.0, points: all.clone() }];
+            let mut vl = vec![];
+            for (ci, ion, v) in &hl {
+                if !v.is_empty() { ss.push(SvgSeries { name: format!("target ion m/z {}", mz4(*ion)), rgb: color_rgb(pal(*ci)), width: 2.0, points: v.clone() }); }
+                vl.push(SvgVLine { x: *ion, rgb: color_rgb(pal(*ci)), label: String::new() });
+            }
+            let yf: fn(f64) -> String = if norm { pct0 } else { sci };
+            let plot = SvgPlot {
+                title: head.clone(), x_label: "m/z".into(), y_label: if norm { "Intensity (% of maximum)".into() } else { "Intensity".into() },
+                series: ss, vlines: vl, bounds: [x0, x1, y0, y1], x_fmt: mz4, y_fmt: yf,
+            };
+            let stem = format!("ms2_scan_{}_{}", sp.scan, safe_name(&sm.data.name));
+            self.do_export(k, plot, rect, &stem);
+        }
+    }
+
+    /// Asks for a file name, then writes the SVG at once or schedules a PNG capture of the plot rectangle.
+    fn do_export(&mut self, kind: ExportKind, plot: SvgPlot, rect: egui::Rect, stem: &str) {
+        let (ext, label) = if kind == ExportKind::Svg { ("svg", "SVG image") } else { ("png", "PNG image") };
+        let mut d = rfd::FileDialog::new().set_title("Save figure").add_filter(label, &[ext]).set_file_name(format!("{}.{}", stem, ext));
+        if let Some(dir) = Path::new(&self.out_path).parent() { if dir.is_dir() { d = d.set_directory(dir); } }
+        let path = match d.save_file() { Some(p) => p, None => return };
+        match kind {
+            ExportKind::Svg => match std::fs::write(&path, svg::render(&plot)) {
+                Ok(_) => { self.audit.log("FIGURE_EXPORTED", &format!("{} ({})", path.display(), plot.title)); self.status = format!("Saved {}", path.display()); }
+                Err(e) => self.status = format!("Saving the figure failed: {}", e),
+            },
+            ExportKind::Png => {
+                self.status = format!("Capturing the plot to {} ...", path.display());
+                self.capture = Some(Capture { rect, path, frames: 3, sent: false });
+            }
+        }
+    }
+
+    /// Crops the window screenshot to the plot rectangle and writes it as PNG.
+    fn save_png(&mut self, ctx: &egui::Context, img: &egui::ColorImage, cap: Capture) {
+        let ppp = ctx.pixels_per_point();
+        let (iw, ih) = (img.size[0], img.size[1]);
+        let px = |v: f32, max: usize| ((v * ppp).round().max(0.0) as usize).min(max);
+        let (x0, y0, x1, y1) = (px(cap.rect.min.x, iw), px(cap.rect.min.y, ih), px(cap.rect.max.x, iw), px(cap.rect.max.y, ih));
+        if x1 <= x0 || y1 <= y0 { self.status = "Capture failed: the plot is not visible.".into(); return; }
+        let mut rgb = Vec::with_capacity((x1 - x0) * (y1 - y0) * 3);
+        for y in y0..y1 { for x in x0..x1 { let p = img.pixels[y * iw + x]; rgb.extend_from_slice(&[p.r(), p.g(), p.b()]); } }
+        match png::encode_rgb((x1 - x0) as u32, (y1 - y0) as u32, &rgb) {
+            Ok(bytes) => match std::fs::write(&cap.path, bytes) {
+                Ok(_) => { self.audit.log("FIGURE_EXPORTED", &cap.path.display().to_string()); self.status = format!("Saved {}", cap.path.display()); }
+                Err(e) => self.status = format!("Saving the figure failed: {}", e),
+            },
+            Err(e) => self.status = format!("PNG encoding failed: {}", e),
+        }
     }
 }
 
@@ -1597,11 +1813,48 @@ impl eframe::App for App {
                 Msg::Loaded(d, info) => self.add_sample(d, info),
                 Msg::Err(e) => self.status = format!("Load failed: {}", e),
                 Msg::Finished => self.loading = self.loading.saturating_sub(1),
+                Msg::ProjectSaved { path, result, src_paths, missing } => {
+                    self.saving = self.saving.saturating_sub(1);
+                    match result {
+                        Ok(offs) => {
+                            let (mut n, mut bytes) = (0usize, 0u64);
+                            for (sp, o) in src_paths.iter().zip(offs.iter()) {
+                                if let Some((off, len)) = o {
+                                    n += 1;
+                                    bytes += *len;
+                                    for s in self.samples.iter_mut().filter(|s| &s.src_path == sp) {
+                                        s.source = RawSource::Embedded { project: path.clone(), offset: *off, len: *len };
+                                    }
+                                }
+                            }
+                            self.audit.log("PROJECT_SAVED", &format!("{} embedded_raw_files={} embedded_bytes={}", path.display(), n, bytes));
+                            let mut msg = format!("Saved project {} ({} raw file(s) embedded, {:.1} MB)", path.display(), n, bytes as f64 / 1e6);
+                            if !missing.is_empty() { msg += &format!("  ⚠ not embedded (original file not found): {}", missing.join(", ")); }
+                            self.status = msg;
+                            self.project_path = Some(path);
+                        }
+                        Err(e) => self.status = format!("Saving the project failed: {}", e),
+                    }
+                }
             }
         }
         if self.loading == 0 { if let Some(p) = self.pending.take() { self.finish_project(p); } }
         for f in ctx.input(|i| i.raw.dropped_files.clone()) {
             if let Some(p) = f.path { self.load_path(ctx, &p.to_string_lossy()); }
+        }
+        let shot: Option<Arc<egui::ColorImage>> = ctx.input(|i| i.events.iter().find_map(|e| match e {
+            egui::Event::Screenshot { image, .. } => Some(image.clone()),
+            _ => None,
+        }));
+        match self.capture.as_ref().map(|c| (c.sent, c.frames)) {
+            Some((true, _)) => if let Some(img) = shot { if let Some(cap) = self.capture.take() { self.save_png(ctx, &img, cap); } },
+            Some((false, 0)) => {
+                if let Some(c) = self.capture.as_mut() { c.sent = true; }
+                ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+                ctx.request_repaint();
+            }
+            Some((false, _)) => { if let Some(c) = self.capture.as_mut() { c.frames -= 1; } ctx.request_repaint(); }
+            None => {}
         }
         self.shortcuts(ctx);
         self.fix_selection();
@@ -1627,10 +1880,6 @@ impl eframe::App for App {
                     }
                 }
                 ui.separator();
-                ui.label("File path:");
-                ui.add(egui::TextEdit::singleline(&mut self.path_in).desired_width(260.0));
-                if ui.button("Load").clicked() { let p = self.path_in.trim().trim_matches('"').to_string(); self.load_path(ctx, &p); }
-                ui.separator();
                 ui.label("Results file:");
                 let r = ui.add(egui::TextEdit::singleline(&mut self.out_path).desired_width(220.0)).on_hover_text("Click to choose the output file in the file browser");
                 if r.clicked() { self.choose_out_path(); }
@@ -1646,7 +1895,7 @@ impl eframe::App for App {
                     if Path::new(self.trfp_path.trim().trim_matches('"')).is_file() { ui.colored_label(Color32::GREEN, "found"); }
                     else { ui.colored_label(Color32::RED, "not found"); }
                 }
-                if self.loading > 0 { ui.spinner(); }
+                if self.loading > 0 || self.saving > 0 { ui.spinner(); }
             });
             ui.horizontal(|ui| {
                 let mut ch = false;
@@ -2035,8 +2284,15 @@ mod tests {
         a.pin_scan(0, 7.0);
         assert!(matches!(a.spectrum_pick(), Some((0, _, "pinned"))));
         a.hover = Some((0, 2.0));
+        assert!(matches!(a.spectrum_pick(), Some((0, _, "pinned"))), "hover is ignored by default");
+        a.follow_hover = true;
         assert!(matches!(a.spectrum_pick(), Some((0, _, "hovered"))));
         a.follow_hover = false;
         assert!(matches!(a.spectrum_pick(), Some((0, _, "pinned"))));
+    }
+
+    #[test]
+    fn spectrum_panel_does_not_follow_hover_by_default() {
+        assert!(!app().follow_hover);
     }
 }
