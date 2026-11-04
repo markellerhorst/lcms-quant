@@ -1,11 +1,11 @@
 use crate::{
     audit::{self, iso_now, Audit},
-    fmt::{mz4, parse_sci, pct0, rt2, sci},
+    fmt::{mz4, parse_sci, pct0, rt2, sci, sci3},
     history::History,
     mzml::{self, MzData, Spectrum},
     png,
     project::{self, BlobSource, CellRec, ProjectFile, RawSource, SampleRec},
-    svg::{self, SvgPlot, SvgSeries, SvgVLine},
+    svg::{self, SvgLabel, SvgPlot, SvgSeries, SvgVLine},
     quant::*,
     rawconv,
 };
@@ -26,7 +26,8 @@ const MAX_UNDO: usize = 10;
 macro_rules! sciplot {
     ($p:expr) => {
         $p.x_axis_formatter(|m, _| sci(m.value))
-            .y_axis_formatter(|m, _| sci(m.value))
+            .y_axis_formatter(|m, _| sci3(m.value))
+            .y_axis_min_width(85.0)
             .label_formatter(|name, v| {
                 let head = if name.is_empty() { String::new() } else { format!("{}\n", name) };
                 format!("{}x = {}\ny = {}", head, sci(v.x), sci(v.y))
@@ -34,35 +35,36 @@ macro_rules! sciplot {
     };
 }
 
-/// Chromatogram plots: retention-time axis with two decimals; y axis in scientific notation, or 0-100 % when normalised.
+/// Chromatogram plots: retention-time axis with two decimals; y axis in compact scientific notation, or 0-100 % when normalised.
+/// The y axis gets a minimum width so that the axis title never collides with the tick labels.
 macro_rules! rtplot {
     ($p:expr, $norm:expr) => {{
         let mut p = $p
             .x_axis_formatter(|m, _| format!("{:.2}", m.value))
-            .y_axis_formatter(move |m, _| if $norm { pct0(m.value) } else { sci(m.value) })
+            .y_axis_formatter(move |m, _| if $norm { pct0(m.value) } else { sci3(m.value) })
+            .y_axis_min_width(85.0)
             .show_x(false)
             .show_y(false);
-        if $norm { p = p.include_y(0.0).include_y(100.0).set_margin_fraction(egui::vec2(0.0, 0.0)); }
+        if $norm { p = p.include_y(0.0).include_y(100.0).set_margin_fraction(egui::vec2(0.0, 0.05)); }
         p
     }};
 }
 
-/// Spectrum plots: m/z with four decimals; y axis in scientific notation, or 0-100 % when normalised.
+/// Spectrum plots: m/z with four decimals; no default cursor label (the snapped peak is drawn by hand).
 macro_rules! mzplot {
     ($p:expr, $norm:expr) => {{
         let mut p = $p
             .x_axis_formatter(|m, _| mz4(m.value))
-            .y_axis_formatter(move |m, _| if $norm { pct0(m.value) } else { sci(m.value) })
-            .label_formatter(move |name, v| {
-                let head = if name.is_empty() { String::new() } else { format!("{}\n", name) };
-                format!("{}m/z = {}\nintensity = {}", head, mz4(v.x), if $norm { pct0(v.y) } else { sci(v.y) })
-            });
-        if $norm { p = p.include_y(0.0).include_y(100.0).set_margin_fraction(egui::vec2(0.0, 0.0)); }
+            .y_axis_formatter(move |m, _| if $norm { pct0(m.value) } else { sci3(m.value) })
+            .y_axis_min_width(85.0)
+            .show_x(false)
+            .show_y(false);
+        if $norm { p = p.include_y(0.0).include_y(100.0).set_margin_fraction(egui::vec2(0.0, 0.05)); }
         p
     }};
 }
 
-/// Draws the traces, finds the point nearest to the cursor and annotates it with m/z, RT, scan number and intensity.
+/// Draws the traces, finds the point nearest to the cursor and annotates it with m/z, RT, scan (and precursor) and intensity.
 /// `$cap`: true while a PNG capture is pending (no hover annotation in the picture).
 macro_rules! draw_series {
     ($pu:ident, $series:expr, $hover:ident, $scan_of:ident, $cap:expr) => {{
@@ -82,7 +84,7 @@ macro_rules! draw_series {
             let b = $pu.plot_bounds();
             let right = h.rt > (b.min()[0] + b.max()[0]) / 2.0;
             let pct = if h.scale != 1.0 { format!(" ({:.1}%)", h.y * h.scale) } else { String::new() };
-            let txt = format!("{}\n{}\nRT {:.2} min · scan {}\nintensity {}{}", h.fname, h.desc, h.rt, $scan_of(h.file, h.level, h.idx), sci(h.y), pct);
+            let txt = format!("{}\n{}\nRT {:.2} min · {}\nintensity {}{}", h.fname, h.desc, h.rt, $scan_of(h.file, h.level, h.idx), sci(h.y), pct);
             $pu.points(Points::new(vec![[h.rt, h.y * h.scale]]).radius(5.0_f32).color(Color32::WHITE));
             $pu.text(Text::new(PlotPoint::new(h.rt, h.y * h.scale),
                 RichText::new(txt).color(Color32::WHITE).background_color(Color32::from_black_alpha(200)))
@@ -91,18 +93,22 @@ macro_rules! draw_series {
     }};
 }
 
-/// Right-click menu of a plot: save as PNG or SVG.
+/// Right-click menu of a plot: save as PNG / SVG, or one trace as a two-column CSV.
 macro_rules! export_menu {
-    ($resp:expr, $what:expr, $out:ident) => {
+    ($resp:expr, $what:expr, $out:ident, $names:expr) => {
         $resp.context_menu(|ui| {
             if ui.button(format!("Save {} as PNG…", $what)).clicked() { $out = Some(ExportKind::Png); ui.close_menu(); }
             if ui.button(format!("Save {} as SVG…", $what)).clicked() { $out = Some(ExportKind::Svg); ui.close_menu(); }
+            ui.separator();
+            for (i, n) in $names.iter().enumerate().take(20) {
+                if ui.button(format!("Save '{}' as CSV (2 columns)…", n)).clicked() { $out = Some(ExportKind::Csv(i)); ui.close_menu(); }
+            }
         })
     };
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum ExportKind { Png, Svg }
+enum ExportKind { Png, Svg, Csv(usize) }
 
 /// A pending PNG capture of one plot (taken from the window screenshot after the context menu has closed).
 struct Capture { rect: egui::Rect, path: PathBuf, frames: u8, sent: bool }
@@ -118,6 +124,52 @@ fn svg_series(series: &[Series]) -> Vec<SvgSeries> {
         name: s.name.clone(), rgb: color_rgb(pal(s.ci)), width: if s.cur { 2.5 } else { 1.5 },
         points: s.data.iter().map(|p| [p[0], p[1] * s.scale]).collect(),
     }).collect()
+}
+
+/// Two-column CSV text.
+fn csv_two(h1: &str, h2: &str, pts: impl Iterator<Item = (f64, f64)>) -> String {
+    let mut s = format!("{},{}\n", h1, h2);
+    for (x, y) in pts { s += &format!("{},{}\n", x, y); }
+    s
+}
+
+/// Precursor m/z for display: four decimals or "n/a".
+fn prec_str(p: Option<f64>) -> String { p.map(mz4).unwrap_or_else(|| "n/a".into()) }
+
+/// The `n` most intense peaks (m/z, intensity), strongest first.
+fn top_peaks(mz: &[f64], inten: &[f32], n: usize) -> Vec<(f64, f64)> {
+    let mut v: Vec<(f64, f64)> = mz.iter().cloned().zip(inten.iter().map(|&i| i as f64)).collect();
+    v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    v.truncate(n);
+    v
+}
+
+/// Peak (m/z, scaled intensity) closest to the cursor: plot-normalised distance from the cursor to the peak's stem.
+fn nearest_peak(mz: &[f64], inten: &[f32], scale: f64, px: f64, py: f64, xw: f64, yw: f64) -> Option<(f64, f64)> {
+    if mz.is_empty() || xw <= 0.0 || yw <= 0.0 { return None; }
+    let lo = mz.partition_point(|&m| m < px - 0.08 * xw);
+    let mut best: Option<(f64, f64, f64)> = None;
+    for i in lo..mz.len() {
+        if mz[i] > px + 0.08 * xw { break; }
+        let y = inten[i] as f64 * scale;
+        let dx = (mz[i] - px).abs() / xw;
+        let dy0 = if py > y { py - y } else if py < 0.0 { -py } else { 0.0 };
+        let dy = dy0 / yw;
+        let d = (dx * dx + dy * dy).sqrt();
+        if best.map(|b| d < b.0).unwrap_or(true) { best = Some((d, mz[i], y)); }
+    }
+    best.map(|b| (b.1, b.2))
+}
+
+/// "MS2 scan 123 · precursor m/z 286.1438" (or "n/a"), "MS1 scan 45".
+fn scan_info(d: &MzData, l: u8, j: usize) -> String {
+    if l == 1 { format!("MS1 scan {}", d.ms1.get(j).map(|x| x.scan).unwrap_or(0)) }
+    else {
+        match d.spectra.get(j) {
+            Some(x) => format!("MS2 scan {} · precursor m/z {}", x.scan, prec_str(x.precursor)),
+            None => "MS2 scan ?".into(),
+        }
+    }
 }
 
 struct Series {
@@ -159,6 +211,7 @@ Hulstaert N, Shofstahl J, Sachsenberg T, Walzer M, Barsnes H, Martens L, Perez-R
 It uses Thermo Fisher Scientific's RawFileReader library (Copyright Thermo Fisher Scientific, Inc.), subject to Thermo's license.\n\
 The external-converter approach follows mzmine: https://github.com/mzmine/mzmine (MIT).\n\
 GUI: egui / eframe / egui_plot (MIT or Apache-2.0), https://github.com/emilk/egui; file dialogs: rfd (MIT).\n\
+Project: https://github.com/markellerhorst/lcms-quant\n\
 Built with Claude Sonnet 5.5 (Medium); app icon generated with Gemini.";
 
 #[derive(Clone, Copy, PartialEq)]
@@ -175,22 +228,22 @@ impl Kind {
 #[derive(Clone, Copy, PartialEq)]
 enum Mode { Areas, Curve }
 #[derive(Clone, Copy, PartialEq)]
-enum View { Xic, Tic, Bpc }
+enum View { Xic, Tic, Bpc, Quick }
 #[derive(Clone, Copy, PartialEq)]
 enum Scope { Ions, AllTargets, Files }
 #[derive(Clone, Copy, PartialEq)]
-enum Tab { Chrom, Matrix }
+enum Tab { Chrom, Matrix, Setup }
 #[derive(Clone, Copy, PartialEq)]
 enum Basis { Ms2, Ms1 }
 
 #[derive(Clone)]
-struct Cell { start: f64, end: f64, found: bool, manual: bool, areas: Vec<f64>, logged: (f64, f64), include: bool }
+struct Cell { start: f64, end: f64, found: bool, manual: bool, areas: Vec<f64>, logged: (f64, f64), include: bool, conc: f64 }
 impl Cell {
-    fn new() -> Cell { Cell { start: 0.0, end: 0.0, found: false, manual: false, areas: vec![], logged: (0.0, 0.0), include: true } }
+    fn new() -> Cell { Cell { start: 0.0, end: 0.0, found: false, manual: false, areas: vec![], logged: (0.0, 0.0), include: true, conc: 0.0 } }
 }
 
 struct Sample {
-    data: Arc<MzData>, src_path: String, raw_sha: String, source: RawSource, kind: Kind, conc: f64,
+    data: Arc<MzData>, src_path: String, raw_sha: String, source: RawSource, kind: Kind,
     xics: Vec<Vec<Vec<[f64; 2]>>>, cells: Vec<Cell>,
     show: bool, rt_shift: f64, shift_ui: f64,
 }
@@ -198,7 +251,7 @@ struct Sample {
 /// Everything undo/redo needs. Raw data is shared (Arc), derived chromatograms are recomputed on restore.
 #[derive(Clone)]
 struct SampleState {
-    data: Arc<MzData>, src_path: String, raw_sha: String, source: RawSource, kind: Kind, conc: f64,
+    data: Arc<MzData>, src_path: String, raw_sha: String, source: RawSource, kind: Kind,
     cells: Vec<Cell>, show: bool, rt_shift: f64,
 }
 #[derive(Clone)]
@@ -268,6 +321,11 @@ pub struct App {
     embed_raw: bool,
     saving: usize,
     capture: Option<Capture>,
+    show_prefs: bool,
+    assign_target: usize,
+    assign_conc: f64,
+    quick_mz: f64,
+    quick_level: u8,
 }
 
 fn csv(s: &str) -> String {
@@ -301,6 +359,18 @@ fn dv_rt(v: &mut f64) -> egui::DragValue<'_> {
     egui::DragValue::new(v).custom_formatter(|n, _| format!("{:.2}", n)).custom_parser(parse_sci)
 }
 
+/// DragValue for m/z values: four decimals.
+fn dv_mz(v: &mut f64) -> egui::DragValue<'_> {
+    egui::DragValue::new(v).custom_formatter(|n, _| mz4(n)).custom_parser(parse_sci)
+}
+
+/// DragValue for standard concentrations: "–" means "not a standard for this target".
+fn dv_conc(v: &mut f64) -> egui::DragValue<'_> {
+    egui::DragValue::new(v)
+        .custom_formatter(|n, _| if n == 0.0 { "–".to_string() } else { sci(n) })
+        .custom_parser(|s| if s.trim().is_empty() || s.trim() == "–" || s.trim() == "-" { Some(0.0) } else { parse_sci(s) })
+}
+
 fn parse_row(r: &[String; 4]) -> Option<Analyte> {
     let name = r[0].trim().to_string();
     if name.is_empty() { return None; }
@@ -325,7 +395,7 @@ impl App {
             tol_ppm: true, tol: 10.0, rt_win: 0.3, weighting: 2, baseline: true, ratio_tol: 30.0,
             units: "ng/mL".into(), reason: String::new(), settings_dirty: false,
             out_path: "results.csv".into(),
-            status: "Drop a .csv target table (optional) and Thermo .raw files onto the window, or use the File menu.".into(),
+            status: "Drop a .csv target table (optional) and Thermo .raw / mzML files onto the window, or use the File menu.".into(),
             show_audit: false, show_credits: false, show_readme: false, show_targets: false,
             grab: None, editing: false, audit: Audit::new(audit_path), user_logged: "N/A".into(), tx, rx, loading: 0,
             trfp_path: String::new(),
@@ -336,6 +406,7 @@ impl App {
             zoom: 1.0, title: String::new(),
             basis: Basis::Ms2, show_spectrum: true, spec_autofit: true, follow_hover: false, pinned_scan: None, hover: None,
             col_w: [0.0; 4], embed_raw: true, saving: 0, capture: None,
+            show_prefs: false, assign_target: 0, assign_conc: 1.0, quick_mz: 100.0, quick_level: 1,
         };
         app.load_settings();
         app
@@ -347,12 +418,13 @@ impl App {
             for l in s.lines() {
                 if let Some(v) = l.strip_prefix("trfp=") { self.trfp_path = v.to_string(); }
                 if let Some(v) = l.strip_prefix("user=") { if !v.trim().is_empty() { self.audit.user = v.trim().to_string(); self.user_logged = self.audit.user.clone(); } }
+                if let Some(v) = l.strip_prefix("embed=") { self.embed_raw = v.trim() != "false"; }
                 if let Some(v) = l.strip_prefix("zoom=") { if let Ok(z) = v.parse::<f32>() { self.zoom = z.clamp(0.5, 3.0); } }
             }
         }
     }
     fn write_settings(&self) {
-        let _ = std::fs::write("lcms_settings.txt", format!("trfp={}\nuser={}\nzoom={}\n", self.trfp_path.trim(), self.audit.user.trim(), self.zoom));
+        let _ = std::fs::write("lcms_settings.txt", format!("trfp={}\nuser={}\nzoom={}\nembed={}\n", self.trfp_path.trim(), self.audit.user.trim(), self.zoom, self.embed_raw));
     }
     fn save_trfp(&mut self) {
         self.write_settings();
@@ -395,7 +467,7 @@ impl App {
         Snapshot {
             label: label.to_string(), analytes: self.analytes.clone(),
             samples: self.samples.iter().map(|s| SampleState {
-                data: s.data.clone(), src_path: s.src_path.clone(), raw_sha: s.raw_sha.clone(), source: s.source.clone(), kind: s.kind, conc: s.conc,
+                data: s.data.clone(), src_path: s.src_path.clone(), raw_sha: s.raw_sha.clone(), source: s.source.clone(), kind: s.kind,
                 cells: s.cells.clone(), show: s.show, rt_shift: s.rt_shift,
             }).collect(),
             sel_s: self.sel_s, sel_a: self.sel_a, params: self.params_vec(),
@@ -406,7 +478,7 @@ impl App {
         self.analytes = s.analytes;
         self.apply_params(&s.params);
         self.samples = s.samples.into_iter().map(|st| Sample {
-            data: st.data, src_path: st.src_path, raw_sha: st.raw_sha, source: st.source, kind: st.kind, conc: st.conc, xics: vec![], cells: st.cells,
+            data: st.data, src_path: st.src_path, raw_sha: st.raw_sha, source: st.source, kind: st.kind, xics: vec![], cells: st.cells,
             show: st.show, rt_shift: st.rt_shift, shift_ui: st.rt_shift,
         }).collect();
         self.sel_s = s.sel_s.min(self.samples.len().saturating_sub(1));
@@ -500,7 +572,7 @@ impl App {
         if !raw.is_file() { self.status = format!("Only single Thermo .raw files are supported / file not found: {}", path); return false; }
         let trfp = match rawconv::find_trfp(&self.trfp_path) {
             Some(p) => p,
-            None => { self.status = "ThermoRawFileParser not found: enter the path to ThermoRawFileParser.exe in the top bar.".into(); return false; }
+            None => { self.show_prefs = true; self.status = "ThermoRawFileParser not found: set its location under Edit → Preferences.".into(); return false; }
         };
         self.loading += 1;
         self.status = format!("Reading {} (held in memory only)...", path);
@@ -526,9 +598,33 @@ impl App {
     /// Re-imports a raw file that is stored inside a project: it is copied to a temporary file (ThermoRawFileParser can only read
     /// from a path), converted in memory, and the temporary copy is deleted again right away.
     fn start_load_embedded(&mut self, ctx: &egui::Context, rec_path: String, project: PathBuf, offset: u64, len: u64) -> bool {
+        if rec_path.to_lowercase().ends_with(".mzml") {
+            // embedded mzML: parse straight from the project file, no converter and no temporary file
+            self.loading += 1;
+            self.status = format!("Reading {} from the project...", rec_path);
+            let (tx, ctx) = (self.tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                match project::read_blob(&project, offset, len) {
+                    Ok(bytes) => {
+                        let name = Path::new(&rec_path).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| "embedded.mzML".into());
+                        match mzml::parse_bytes(&name, &bytes) {
+                            Ok(d) => {
+                                let h = d.sha256.clone();
+                                let _ = tx.send(Msg::Loaded(d, LoadInfo { path: rec_path, raw_sha: h, detail: "format=mzML embedded_in_project".into(), source: RawSource::Embedded { project, offset, len } }));
+                            }
+                            Err(e) => { let _ = tx.send(Msg::Err(e)); }
+                        }
+                    }
+                    Err(e) => { let _ = tx.send(Msg::Err(format!("{}: {}", rec_path, e))); }
+                }
+                let _ = tx.send(Msg::Finished);
+                ctx.request_repaint();
+            });
+            return true;
+        }
         let trfp = match rawconv::find_trfp(&self.trfp_path) {
             Some(p) => p,
-            None => { self.status = "ThermoRawFileParser not found: enter the path to ThermoRawFileParser.exe in the top bar.".into(); return false; }
+            None => { self.show_prefs = true; self.status = "ThermoRawFileParser not found: set its location under Edit → Preferences.".into(); return false; }
         };
         self.loading += 1;
         self.status = format!("Reading {} from the project...", rec_path);
@@ -561,14 +657,16 @@ impl App {
 
     fn load_path(&mut self, ctx: &egui::Context, path: &str) {
         let lower = path.to_lowercase();
-        if lower.ends_with(".raw") {
+        if lower.ends_with(".mzml") {
+            self.start_load_mzml(ctx, path);
+        } else if lower.ends_with(".raw") {
             self.start_load(ctx, path);
         } else if lower.ends_with(".quant") {
             self.open_project(ctx, Path::new(path));
         } else if lower.ends_with(".csv") || lower.ends_with(".tsv") || lower.ends_with(".txt") {
             self.load_table(Path::new(path));
         } else {
-            self.status = "Unsupported file: drop Thermo .raw files, a .csv target table or a .quant project.".into();
+            self.status = "Unsupported file: drop Thermo .raw or .mzML files, a .csv target table or a .quant project.".into();
         }
     }
 
@@ -599,13 +697,12 @@ impl App {
         if !in_project { self.push_undo("import file"); }
         let na = self.analytes.len();
         let mut sm = Sample {
-            data: Arc::new(d), src_path: info.path.clone(), raw_sha: info.raw_sha.clone(), source: info.source.clone(), kind: Kind::Unknown, conc: 0.0,
+            data: Arc::new(d), src_path: info.path.clone(), raw_sha: info.raw_sha.clone(), source: info.source.clone(), kind: Kind::Unknown,
             xics: vec![], cells: vec![], show: true, rt_shift: 0.0, shift_ui: 0.0,
         };
         if let Some(p) = self.pending.as_mut() {
             if let Some(rec) = p.recs.iter().find(|r| r.path == info.path) {
                 sm.kind = Kind::from_label(&rec.kind);
-                sm.conc = rec.conc;
                 sm.rt_shift = rec.rt_shift;
                 sm.shift_ui = rec.rt_shift;
                 sm.show = rec.show;
@@ -614,7 +711,7 @@ impl App {
                     if c.analyte < na {
                         let cell = &mut sm.cells[c.analyte];
                         cell.found = c.found; cell.manual = c.manual; cell.start = c.start; cell.end = c.end;
-                        cell.logged = (c.start, c.end); cell.include = c.include;
+                        cell.logged = (c.start, c.end); cell.include = c.include; cell.conc = c.conc.unwrap_or(rec.conc);
                     }
                 }
                 if !rec.raw_sha256.is_empty() && rec.raw_sha256 != info.raw_sha { p.mismatches.push(sm.data.name.clone()); }
@@ -708,8 +805,8 @@ impl App {
         if a >= self.analytes.len() { return; }
         if self.fits.len() != self.analytes.len() { self.fits = vec![None; self.analytes.len()]; }
         let pts: Vec<(f64, f64)> = self.samples.iter()
-            .filter(|s| s.kind == Kind::Standard && s.conc > 0.0 && s.cells.len() > a && s.cells[a].found && s.cells[a].include)
-            .map(|s| (s.conc, s.cells[a].areas[0])).collect();
+            .filter(|s| s.kind == Kind::Standard && s.cells.len() > a && s.cells[a].conc > 0.0 && s.cells[a].found && s.cells[a].include)
+            .map(|s| (s.cells[a].conc, s.cells[a].areas[0])).collect();
         self.fits[a] = fit(&pts, self.weighting);
     }
 
@@ -799,7 +896,7 @@ impl App {
 
     fn ref_ratio(&self, a: usize, ion: usize) -> Option<f64> {
         let v: Vec<f64> = self.samples.iter()
-            .filter(|s| s.kind == Kind::Standard && s.cells.len() > a && s.cells[a].found && s.cells[a].include && s.cells[a].areas[0] > 0.0)
+            .filter(|s| s.kind == Kind::Standard && s.cells.len() > a && s.cells[a].conc > 0.0 && s.cells[a].found && s.cells[a].include && s.cells[a].areas[0] > 0.0)
             .map(|s| s.cells[a].areas[ion] / s.cells[a].areas[0]).collect();
         if v.is_empty() { None } else { Some(v.iter().sum::<f64>() / v.len() as f64) }
     }
@@ -813,7 +910,7 @@ impl App {
         if sm.kind == Kind::Blank { f.push("PEAK IN BLANK".into()); }
         if let (Some(fit), Some(cc)) = (self.fits.get(a).copied().flatten(), self.conc_of(s, a)) {
             if sm.kind != Kind::Standard && (cc < fit.lo || cc > fit.hi) { f.push("outside cal range".into()); }
-            if sm.kind == Kind::Standard && sm.conc > 0.0 && ((cc - sm.conc) / sm.conc).abs() > 0.15 { f.push("accuracy >15%".into()); }
+            if sm.kind == Kind::Standard && c.conc > 0.0 && ((cc - c.conc) / c.conc).abs() > 0.15 { f.push("accuracy >15%".into()); }
         }
         for i in 1..c.areas.len() {
             if let Some(r) = self.ref_ratio(a, i) {
@@ -850,7 +947,7 @@ impl App {
                 let ratios: Vec<String> = (1..c.areas.len()).map(|i| if c.areas[0] > 0.0 { format!("{:.3}", c.areas[i] / c.areas[0]) } else { "n/a".into() }).collect();
                 let conc = self.conc_of(s, a).map(|v| format!("{:.4}", v)).unwrap_or("n/a".into());
                 o += &format!("{},{},{},{},{:.4},{},{:.4},{:.4},{:.1},{},{},{},{}\n", csv(&sm.data.name), sm.data.sha256, sm.kind.label(),
-                    if sm.kind == Kind::Standard && curve { sm.conc.to_string() } else { String::new() }, sm.rt_shift, csv(&self.analytes[a].name),
+                    if sm.kind == Kind::Standard && curve && c.conc > 0.0 { c.conc.to_string() } else { String::new() }, sm.rt_shift, csv(&self.analytes[a].name),
                     c.start, c.end, c.areas[0], c.manual, ratios.join(" "), conc, csv(&self.flags(s, a)));
             }
         }
@@ -954,8 +1051,8 @@ impl App {
         ProjectFile {
             app_version: VERSION.into(), user: self.audit.user.clone(), params: self.params_vec(), analytes: self.analytes.clone(),
             samples: self.samples.iter().map(|s| SampleRec {
-                path: s.src_path.clone(), raw_sha256: s.raw_sha.clone(), kind: s.kind.label().into(), conc: s.conc, rt_shift: s.rt_shift, show: s.show, embedded: false,
-                cells: s.cells.iter().enumerate().map(|(i, c)| CellRec { analyte: i, found: c.found, manual: c.manual, start: c.start, end: c.end, include: c.include }).collect(),
+                path: s.src_path.clone(), raw_sha256: s.raw_sha.clone(), kind: s.kind.label().into(), conc: 0.0, rt_shift: s.rt_shift, show: s.show, embedded: false,
+                cells: s.cells.iter().enumerate().map(|(i, c)| CellRec { analyte: i, found: c.found, manual: c.manual, start: c.start, end: c.end, include: c.include, conc: Some(c.conc) }).collect(),
             }).collect(),
         }
     }
@@ -1014,7 +1111,7 @@ impl App {
         for (rec, off) in pf.samples.iter().zip(offs.iter()) {
             let ok = match off {
                 Some((o, l)) => self.start_load_embedded(ctx, rec.path.clone(), path.to_path_buf(), *o, *l),
-                None => self.start_load(ctx, &rec.path),
+                None => self.start_load_any(ctx, &rec.path),
             };
             if ok { started += 1; }
         }
@@ -1062,7 +1159,8 @@ impl App {
         let clicked;
         let mut hover: Option<Hover> = None;
         let mut ex: Option<ExportKind> = None;
-        let mut export_req: Option<(ExportKind, SvgPlot, egui::Rect)> = None;
+        let mut export_req: Option<(ExportKind, SvgPlot, egui::Rect, String)> = None;
+        let mut csv_req: Option<(String, String)> = None;
         let tmz = self.trace_mz(a);
         let capturing = self.capture.is_some();
         {
@@ -1076,10 +1174,7 @@ impl App {
                 Series { name: d.clone(), data: x.clone(), ci: i, cur: false, file: s, level, fname: sm.data.name.clone(),
                          desc: format!("{} · {}", self.analytes[a].name, d), scale: if norm && mx > 0.0 { 100.0 / mx } else { 1.0 } }
             }).collect();
-            let scan_of = |f: usize, l: u8, j: usize| -> u32 {
-                let d = &self.samples[f].data;
-                if l == 1 { d.ms1.get(j).map(|x| x.scan).unwrap_or(0) } else { d.spectra.get(j).map(|x| x.scan).unwrap_or(0) }
-            };
+            let scan_of = |f: usize, l: u8, j: usize| -> String { scan_info(&self.samples[f].data, l, j) };
             let pr = rtplot!(Plot::new("xic").height(300.0).allow_drag(false).allow_boxed_zoom(false)
                 .legend(Legend::default()).x_axis_label("Retention time (min)  |  drag a green/red boundary line, click = pin the scan")
                 .y_axis_label(if norm { "Intensity (% of maximum)" } else { "Intensity" }), norm)
@@ -1111,27 +1206,40 @@ impl App {
             clicked = pr.response.clicked() && !capturing;
             let rect = pr.response.rect;
             let (x0, x1, y0, y1) = { let b = pr.transform.bounds(); (b.min()[0], b.max()[0], b.min()[1], b.max()[1]) };
-            export_menu!(pr.response, "chromatogram", ex);
+            let names: Vec<String> = series.iter().map(|s| s.name.clone()).collect();
+            export_menu!(pr.response, "chromatogram", ex, &names);
             if let Some(k) = ex {
-                let mut vl = vec![];
-                if c.found {
-                    vl.push(SvgVLine { x: c.start, rgb: (0, 100, 0), label: "integration start".into() });
-                    vl.push(SvgVLine { x: c.end, rgb: (139, 0, 0), label: "integration end".into() });
+                let (file, target) = (safe_name(&sm.data.name), safe_name(&self.analytes[a].name));
+                match k {
+                    ExportKind::Csv(i) => {
+                        if let Some(sr) = series.get(i) {
+                            csv_req = Some((format!("XIC_{}_mz{}_{}", target, mz4(tmz[i]), file),
+                                            csv_two("RT (min)", "Intensity", sr.data.iter().map(|p| (p[0], p[1])))));
+                        }
+                    }
+                    _ => {
+                        let mut vl = vec![];
+                        if c.found {
+                            vl.push(SvgVLine { x: c.start, rgb: (0, 100, 0), label: "integration start".into() });
+                            vl.push(SvgVLine { x: c.end, rgb: (139, 0, 0), label: "integration end".into() });
+                        }
+                        let yf: fn(f64) -> String = if norm { pct0 } else { sci3 };
+                        export_req = Some((k, SvgPlot {
+                            title: format!("{} · {}", sm.data.name, self.analytes[a].name),
+                            x_label: "Retention time (min)".into(),
+                            y_label: if norm { "Intensity (% of maximum)".into() } else { "Intensity".into() },
+                            series: svg_series(&series), vlines: vl, labels: vec![], bounds: [x0, x1, y0, y1], x_fmt: rt2, y_fmt: yf,
+                        }, rect, format!("XIC_{}_{}", target, file)));
+                    }
                 }
-                let yf: fn(f64) -> String = if norm { pct0 } else { sci };
-                export_req = Some((k, SvgPlot {
-                    title: format!("{} · {}", sm.data.name, self.analytes[a].name),
-                    x_label: "Retention time (min)".into(),
-                    y_label: if norm { "Intensity (% of maximum)".into() } else { "Intensity".into() },
-                    series: svg_series(&series), vlines: vl, bounds: [x0, x1, y0, y1], x_fmt: rt2, y_fmt: yf,
-                }, rect));
             }
         }
         if let Some(h) = &hover {
             self.hover = Some((h.file, h.rt));
             if clicked { self.pin_scan(h.file, h.rt); }
         }
-        if let Some((k, plot, rect)) = export_req { let stem = safe_name(&plot.title); self.do_export(k, plot, rect, &stem); }
+        if let Some((k, plot, rect, stem)) = export_req { self.do_export(k, plot, rect, &stem); }
+        if let Some((stem, text)) = csv_req { self.save_csv(&stem, &text); }
         if let Some((st, en)) = edit { self.apply_edit(s, a, st, en); }
         if stopped { self.commit(s, a); grab = None; }
         self.grab = grab;
@@ -1182,7 +1290,16 @@ impl App {
         }
     }
 
-    /// Read-only overlays: all targets of the current file, one target across selected files, or TIC/BPC of selected files.
+    /// m/z chromatogram of the "custom m/z" view for file `f` (aligned retention times).
+    fn quick_trace(&self, f: usize) -> Vec<[f64; 2]> {
+        let sm = &self.samples[f];
+        let sp: &[Spectrum] = if self.quick_level == 1 { &sm.data.ms1 } else { &sm.data.spectra };
+        let mut x = xic(sp, self.quick_mz, self.tol_da(self.quick_mz));
+        if sm.rt_shift != 0.0 { for p in x.iter_mut() { p[0] += sm.rt_shift; } }
+        x
+    }
+
+    /// Read-only overlays: all targets of the current file, one target / a custom m/z across selected files, or TIC/BPC of selected files.
     fn ui_overlay(&mut self, ui: &mut egui::Ui, cur: Option<usize>) {
         let a = self.sel_a;
         let norm = self.normalize;
@@ -1199,6 +1316,14 @@ impl App {
                             series.push(Series { name: an.name.clone(), data: x.clone(), ci: ai, cur: false, file: s, level, fname: sm.data.name.clone(), desc, scale: 1.0 });
                         }
                     }
+                }
+            }
+            (View::Quick, _) => {
+                let desc = format!("custom m/z {} (MS{})", mz4(self.quick_mz), self.quick_level);
+                for &f in &shown {
+                    let sm = &self.samples[f];
+                    series.push(Series { name: sm.data.name.clone(), data: self.quick_trace(f), ci: f, cur: Some(f) == cur, file: f,
+                                         level: self.quick_level, fname: sm.data.name.clone(), desc: desc.clone(), scale: 1.0 });
                 }
             }
             (View::Xic, _) => {
@@ -1238,13 +1363,11 @@ impl App {
         let mut hover: Option<Hover> = None;
         let clicked;
         let mut ex: Option<ExportKind> = None;
-        let mut export_req: Option<(ExportKind, SvgPlot, egui::Rect)> = None;
+        let mut export_req: Option<(ExportKind, SvgPlot, egui::Rect, String)> = None;
+        let mut csv_req: Option<(String, String)> = None;
         let capturing = self.capture.is_some();
         {
-            let scan_of = |f: usize, l: u8, j: usize| -> u32 {
-                let d = &self.samples[f].data;
-                if l == 1 { d.ms1.get(j).map(|x| x.scan).unwrap_or(0) } else { d.spectra.get(j).map(|x| x.scan).unwrap_or(0) }
-            };
+            let scan_of = |f: usize, l: u8, j: usize| -> String { scan_info(&self.samples[f].data, l, j) };
             let pr = rtplot!(Plot::new(id).height(380.0).legend(Legend::default()).x_axis_label("Retention time (min)  |  click = pin the nearest MS2 scan")
                 .y_axis_label(if norm { "Intensity (% of maximum)" } else { "Intensity" }), norm)
                 .show(ui, |pu| {
@@ -1254,28 +1377,51 @@ impl App {
             clicked = pr.response.clicked() && !capturing;
             let rect = pr.response.rect;
             let (x0, x1, y0, y1) = { let b = pr.transform.bounds(); (b.min()[0], b.max()[0], b.min()[1], b.max()[1]) };
-            export_menu!(pr.response, "chromatogram", ex);
+            let names: Vec<String> = series.iter().map(|s| s.name.clone()).collect();
+            export_menu!(pr.response, "chromatogram", ex, &names);
             if let Some(k) = ex {
-                let title = match self.view {
-                    View::Xic => if self.scope == Scope::AllTargets { "Extracted ion chromatograms (quantifier ions of all targets)".to_string() }
-                                 else { format!("Extracted ion chromatogram · {}", self.analytes[a].name) },
-                    View::Tic => format!("Total ion chromatogram (MS{})", self.tic_level),
-                    View::Bpc => format!("Base peak chromatogram (MS{})", self.tic_level),
+                // the file name suggestion says what is exported: TIC / BPC / XIC, MS level, target or m/z, file
+                let filepart = if shown.len() == 1 { safe_name(&self.samples[shown[0]].data.name) } else { format!("{}files", shown.len()) };
+                let (prefix, stem_all, title): (String, String, String) = match self.view {
+                    View::Xic => if self.scope == Scope::AllTargets {
+                        ("XIC".into(), format!("XIC_all-targets_{}", filepart), "Extracted ion chromatograms (quantifier ions of all targets)".into())
+                    } else {
+                        let t = safe_name(&self.analytes[a].name);
+                        (format!("XIC_{}", t), format!("XIC_{}_{}", t, filepart), format!("Extracted ion chromatogram · {}", self.analytes[a].name))
+                    },
+                    View::Tic => (format!("TIC_MS{}", self.tic_level), format!("TIC_MS{}_{}", self.tic_level, filepart), format!("Total ion chromatogram (MS{})", self.tic_level)),
+                    View::Bpc => (format!("BPC_MS{}", self.tic_level), format!("BPC_MS{}_{}", self.tic_level, filepart), format!("Base peak chromatogram (MS{})", self.tic_level)),
+                    View::Quick => {
+                        let p = format!("XIC_custom_mz{}_MS{}", mz4(self.quick_mz), self.quick_level);
+                        (p.clone(), format!("{}_{}", p, filepart), format!("Extracted ion chromatogram · m/z {} (MS{})", mz4(self.quick_mz), self.quick_level))
+                    }
                 };
-                let yf: fn(f64) -> String = if norm { pct0 } else { sci };
-                let vl: Vec<SvgVLine> = rt_hint.map(|h| SvgVLine { x: h, rgb: (128, 128, 128), label: "expected RT".into() }).into_iter().collect();
-                export_req = Some((k, SvgPlot {
-                    title, x_label: "Retention time (min)".into(),
-                    y_label: if norm { "Intensity (% of maximum)".into() } else { "Intensity".into() },
-                    series: svg_series(&series), vlines: vl, bounds: [x0, x1, y0, y1], x_fmt: rt2, y_fmt: yf,
-                }, rect));
+                match k {
+                    ExportKind::Csv(i) => {
+                        if let Some(sr) = series.get(i) {
+                            let stem = if self.view == View::Xic && self.scope == Scope::AllTargets { format!("XIC_{}_{}", safe_name(&sr.name), safe_name(&sr.fname)) }
+                                       else { format!("{}_{}", prefix, safe_name(&sr.name)) };
+                            csv_req = Some((stem, csv_two("RT (min)", "Intensity", sr.data.iter().map(|p| (p[0], p[1])))));
+                        }
+                    }
+                    _ => {
+                        let yf: fn(f64) -> String = if norm { pct0 } else { sci3 };
+                        let vl: Vec<SvgVLine> = rt_hint.map(|h| SvgVLine { x: h, rgb: (128, 128, 128), label: "expected RT".into() }).into_iter().collect();
+                        export_req = Some((k, SvgPlot {
+                            title, x_label: "Retention time (min)".into(),
+                            y_label: if norm { "Intensity (% of maximum)".into() } else { "Intensity".into() },
+                            series: svg_series(&series), vlines: vl, labels: vec![], bounds: [x0, x1, y0, y1], x_fmt: rt2, y_fmt: yf,
+                        }, rect, stem_all));
+                    }
+                }
             }
         }
         if let Some(h) = &hover {
             self.hover = Some((h.file, h.rt));
             if clicked { self.pin_scan(h.file, h.rt); }
         }
-        if let Some((k, plot, rect)) = export_req { let stem = safe_name(&plot.title); self.do_export(k, plot, rect, &stem); }
+        if let Some((k, plot, rect, stem)) = export_req { self.do_export(k, plot, rect, &stem); }
+        if let Some((stem, text)) = csv_req { self.save_csv(&stem, &text); }
     }
 
     fn ui_shift(&mut self, ui: &mut egui::Ui, s: usize) {
@@ -1325,29 +1471,70 @@ impl App {
         match fit {
             Some(f) => ui.label(format!("{}: area = {}·conc + {}   R² = {}   n = {}   weighting {}{}", self.analytes[a].name, sci(f.m), sci(f.b), sci(f.r2),
                 sci(f.n as f64), WEIGHTS[self.weighting as usize], if f.n < 5 { "   ⚠ fewer than 5 points" } else { "" })),
-            None => ui.label("No calibration: mark ≥2 concentration levels as 'Standard' with concentration > 0"),
+            None => ui.label("No calibration for this target: assign standard concentrations in the 'Calibration setup' tab (≥2 levels)."),
         };
-        let mut toggled = None;
+        // standards of THIS target, grouped into concentration levels (replicates share a level)
+        let mut std_idx: Vec<usize> = (0..self.samples.len()).filter(|&i| {
+            let s = &self.samples[i];
+            s.kind == Kind::Standard && s.cells.get(a).map(|c| c.conc > 0.0).unwrap_or(false)
+        }).collect();
+        std_idx.sort_by(|&x, &y| {
+            let (cx, cy) = (self.samples[x].cells[a].conc, self.samples[y].cells[a].conc);
+            cx.partial_cmp(&cy).unwrap_or(std::cmp::Ordering::Equal).then_with(|| self.samples[x].data.name.cmp(&self.samples[y].data.name))
+        });
+        let mut toggled: Option<usize> = None;
+        let mut use_all = false;
+        ui.horizontal(|ui| {
+            if ui.button("Use all replicates").clicked() { use_all = true; }
+            ui.weak(format!("{} standard file(s) assigned to this target; untick a replicate to exclude it from the curve", std_idx.len()));
+        });
         ui.columns(2, |cols| {
             cols[0].push_id("calt", |ui| {
-                egui::Grid::new("caltab").striped(true).show(ui, |ui| {
-                    for h in ["Standard", "Conc", "Area", "Accuracy %", "Use"] { ui.strong(h); }
-                    ui.end_row();
-                    for (si, sm) in self.samples.iter().enumerate() {
-                        if sm.kind != Kind::Standard || sm.cells.len() <= a { continue; }
-                        let c = &sm.cells[a];
-                        ui.label(&sm.data.name); ui.label(sci(sm.conc)); ui.label(sci(c.areas[0]));
-                        ui.label(match fit { Some(f) if f.m != 0.0 && sm.conc > 0.0 => sci(100.0 * ((c.areas[0] - f.b) / f.m) / sm.conc), _ => "-".into() });
-                        let mut inc = c.include;
-                        if ui.checkbox(&mut inc, "").changed() { toggled = Some(si); }
+                egui::ScrollArea::vertical().id_salt("calscroll").max_height(240.0).show(ui, |ui| {
+                    egui::Grid::new("caltab").striped(true).show(ui, |ui| {
+                        for h in ["Level / file", "Conc", "Area", "Accuracy %", "Use"] { ui.strong(h); }
                         ui.end_row();
-                    }
+                        let mut k = 0;
+                        while k < std_idx.len() {
+                            let c0 = self.samples[std_idx[k]].cells[a].conc;
+                            let mut m = k;
+                            while m < std_idx.len() && (self.samples[std_idx[m]].cells[a].conc - c0).abs() <= 1e-9 * c0.max(1.0) { m += 1; }
+                            let group = &std_idx[k..m];
+                            let used: Vec<f64> = group.iter().filter(|&&i| { let c = &self.samples[i].cells[a]; c.found && c.include })
+                                .map(|&i| self.samples[i].cells[a].areas[0]).collect();
+                            let mean = if used.is_empty() { 0.0 } else { used.iter().sum::<f64>() / used.len() as f64 };
+                            let rsd = if used.len() >= 2 && mean > 0.0 {
+                                let var = used.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (used.len() as f64 - 1.0);
+                                100.0 * var.sqrt() / mean
+                            } else { 0.0 };
+                            ui.strong(format!("Level {} {}", sci(c0), self.units));
+                            ui.label(format!("n = {}/{}", used.len(), group.len()));
+                            ui.label(format!("mean {}", sci(mean)));
+                            ui.label(if used.len() >= 2 { format!("RSD {} %", sci(rsd)) } else { String::new() });
+                            ui.label("");
+                            ui.end_row();
+                            for &si in group {
+                                let sm = &self.samples[si];
+                                let c = &sm.cells[a];
+                                ui.label(format!("   {}", sm.data.name));
+                                ui.label(sci(c.conc));
+                                ui.label(sci(c.areas[0]));
+                                ui.label(match fit { Some(f) if f.m != 0.0 => sci(100.0 * ((c.areas[0] - f.b) / f.m) / c.conc), _ => "-".into() });
+                                let mut inc = c.include;
+                                if ui.checkbox(&mut inc, "").changed() { toggled = Some(si); }
+                                ui.end_row();
+                            }
+                            k = m;
+                        }
+                    });
                 });
             });
             let (mut inc_pts, mut exc_pts) = (vec![], vec![]);
-            for sm in self.samples.iter().filter(|s| s.kind == Kind::Standard && s.conc > 0.0 && s.cells.len() > a && s.cells[a].found) {
-                let p = [sm.conc, sm.cells[a].areas[0]];
-                if sm.cells[a].include { inc_pts.push(p) } else { exc_pts.push(p) }
+            for &si in &std_idx {
+                let c = &self.samples[si].cells[a];
+                if !c.found { continue; }
+                let p = [c.conc, c.areas[0]];
+                if c.include { inc_pts.push(p) } else { exc_pts.push(p) }
             }
             sciplot!(Plot::new("cal").height(220.0).x_axis_label(format!("Concentration ({})", self.units)).y_axis_label("Area"))
                 .show(&mut cols[1], |pu| {
@@ -1356,6 +1543,11 @@ impl App {
                     if let Some(f) = fit { pu.line(Line::new(PlotPoints::from(vec![[0.0, f.b], [f.hi * 1.05, f.m * f.hi * 1.05 + f.b]])).name("fit")); }
                 });
         });
+        if use_all {
+            self.push_undo("use all replicates");
+            for &si in &std_idx { self.samples[si].cells[a].include = true; }
+            self.refit(a);
+        }
         if let Some(si) = toggled {
             self.push_undo("calibration point");
             let inc = !self.samples[si].cells[a].include;
@@ -1420,11 +1612,13 @@ impl App {
 
     fn ui_chrom(&mut self, ui: &mut egui::Ui) {
         let cur = self.cur();
+        let mut add_q = false;
         ui.horizontal(|ui| {
             ui.label("View:");
             ui.selectable_value(&mut self.view, View::Xic, "Target XICs");
             ui.selectable_value(&mut self.view, View::Tic, "TIC");
             ui.selectable_value(&mut self.view, View::Bpc, "BPC");
+            ui.selectable_value(&mut self.view, View::Quick, "Custom m/z (quick XIC)");
             ui.separator();
             if self.view == View::Xic {
                 egui::ComboBox::new("scope", "").width(330.0).selected_text(match self.scope {
@@ -1436,6 +1630,14 @@ impl App {
                     ui.selectable_value(&mut self.scope, Scope::AllTargets, "All targets (quant ions), current file");
                     ui.selectable_value(&mut self.scope, Scope::Files, "Selected target (quant ion), all selected files");
                 });
+            } else if self.view == View::Quick {
+                ui.label("m/z");
+                ui.add(dv_mz(&mut self.quick_mz).speed(0.01).range(0.0..=100000.0));
+                ui.label(format!("± {}{}", sci(self.tol), if self.tol_ppm { " ppm" } else { " Da" }));
+                ui.label("level");
+                ui.selectable_value(&mut self.quick_level, 1u8, "MS1");
+                ui.selectable_value(&mut self.quick_level, 2u8, "MS2");
+                if ui.button("Add as target").clicked() { add_q = true; }
             } else {
                 ui.label("Scans:");
                 ui.selectable_value(&mut self.tic_level, 1u8, "MS1");
@@ -1451,6 +1653,7 @@ impl App {
             }
             ui.label(format!("Current file: {}", cur.map(|s| self.samples[s].data.name.clone()).unwrap_or_else(|| "none".into())));
         });
+        if add_q { self.add_quick_target(); }
         let needs_cur = self.view == View::Xic && self.scope != Scope::Files;
         if self.view == View::Xic && self.analytes.is_empty() {
             ui.label("Load a target table (.csv) to see target XICs. TIC and BPC views work without one.");
@@ -1545,9 +1748,9 @@ impl App {
                 if ui.button("Save project as…").clicked() { self.save_project(ctx, true); ui.close_menu(); }
                 ui.checkbox(&mut self.embed_raw, "Embed raw files when saving projects");
                 ui.separator();
-                if ui.button("Import Thermo .raw files…").clicked() {
-                    if let Some(files) = rfd::FileDialog::new().set_title("Import Thermo .raw files").add_filter("Thermo RAW", &["raw"]).pick_files() {
-                        for f in files { self.start_load(ctx, &f.to_string_lossy()); }
+                if ui.button("Import .raw / .mzML files…").clicked() {
+                    if let Some(files) = rfd::FileDialog::new().set_title("Import Thermo .raw or mzML files").add_filter("Thermo RAW / mzML", &["raw", "mzML", "mzml"]).pick_files() {
+                        for f in files { self.start_load_any(ctx, &f.to_string_lossy()); }
                     }
                     ui.close_menu();
                 }
@@ -1571,6 +1774,8 @@ impl App {
                 ui.weak(format!("history: {} back / {} forward (max {})", nu, nr, MAX_UNDO));
                 ui.separator();
                 if ui.button("Edit target table…").clicked() { self.show_targets = true; ui.close_menu(); }
+                ui.separator();
+                if ui.button("Preferences…").clicked() { self.show_prefs = true; ui.close_menu(); }
             });
             ui.menu_button("View", |ui| {
                 if ui.add(egui::Button::new("Zoom in").shortcut_text("Ctrl++")).clicked() { self.zoom = (self.zoom + 0.1).min(3.0); }
@@ -1579,6 +1784,7 @@ impl App {
                 ui.separator();
                 if ui.selectable_label(self.tab == Tab::Chrom, "Chromatograms").clicked() { self.tab = Tab::Chrom; ui.close_menu(); }
                 if ui.selectable_label(self.tab == Tab::Matrix, "Results matrix (all files)").clicked() { self.tab = Tab::Matrix; ui.close_menu(); }
+                if ui.selectable_label(self.tab == Tab::Setup, "Calibration setup").clicked() { self.tab = Tab::Setup; ui.close_menu(); }
                 ui.separator();
                 ui.checkbox(&mut self.show_spectrum, "MS2 spectrum panel");
                 if ui.button("Audit trail").clicked() { self.show_audit = true; ui.close_menu(); }
@@ -1705,7 +1911,7 @@ impl App {
         None
     }
 
-    /// Second graph: MS2 spectrum of the selected target (stems; target product ions highlighted).
+    /// Second graph: MS2 spectrum (stems; target product ions highlighted). The cursor snaps to the nearest peak.
     fn ui_spectrum(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.strong("MS2 spectrum");
@@ -1718,55 +1924,101 @@ impl App {
             Some(x) => x,
             None => { ui.label("No MS2 scan to show: select a file and a target with a detected peak, or click the chromatogram to pin a scan."); return; }
         };
-        let sm = &self.samples[f];
-        let sp = &sm.data.spectra[i];
-        let norm = self.normalize;
-        let mx = sp.inten.iter().cloned().fold(0.0f32, f32::max) as f64;
-        let scale = if norm && mx > 0.0 { 100.0 / mx } else { 1.0 };
-        let head = format!("{} · MS2 scan {} · RT {:.2} min · {} peaks · shown: {}", sm.data.name, sp.scan, sp.rt + sm.rt_shift, sp.mz.len(), why);
-        ui.label(&head);
-        let mut all: Vec<[f64; 2]> = Vec::with_capacity(sp.mz.len() * 3);
-        for (m, y) in sp.mz.iter().zip(sp.inten.iter()) { let y = *y as f64 * scale; all.push([*m, 0.0]); all.push([*m, y]); all.push([*m, 0.0]); }
-        let mut hl: Vec<(usize, f64, Vec<[f64; 2]>)> = vec![];
-        if self.sel_a < self.analytes.len() {
-            for (k, &ion) in self.analytes[self.sel_a].ions.iter().enumerate() {
-                let tol = self.tol_da(ion);
-                let mut v = vec![];
-                for (m, y) in sp.mz.iter().zip(sp.inten.iter()) {
-                    if (*m - ion).abs() <= tol { let y = *y as f64 * scale; v.push([*m, 0.0]); v.push([*m, y]); v.push([*m, 0.0]); }
+        let mut export_req: Option<(ExportKind, SvgPlot, egui::Rect, String)> = None;
+        let mut csv_req: Option<(String, String)> = None;
+        {
+            let sm = &self.samples[f];
+            let sp = &sm.data.spectra[i];
+            let norm = self.normalize;
+            let capturing = self.capture.is_some();
+            let mx = sp.inten.iter().cloned().fold(0.0f32, f32::max) as f64;
+            let scale = if norm && mx > 0.0 { 100.0 / mx } else { 1.0 };
+            let rt_scan = sp.rt + sm.rt_shift;
+            let head = format!("{} · MS2 scan {} · RT {:.2} min · precursor m/z {} · {} peaks · shown: {}",
+                sm.data.name, sp.scan, rt_scan, prec_str(sp.precursor), sp.mz.len(), why);
+            ui.label(&head);
+            let mut all: Vec<[f64; 2]> = Vec::with_capacity(sp.mz.len() * 3);
+            for (m, y) in sp.mz.iter().zip(sp.inten.iter()) { let y = *y as f64 * scale; all.push([*m, 0.0]); all.push([*m, y]); all.push([*m, 0.0]); }
+            let mut hl: Vec<(usize, f64, Vec<[f64; 2]>)> = vec![];
+            if self.sel_a < self.analytes.len() {
+                for (k, &ion) in self.analytes[self.sel_a].ions.iter().enumerate() {
+                    let tol = self.tol_da(ion);
+                    let mut v = vec![];
+                    for (m, y) in sp.mz.iter().zip(sp.inten.iter()) {
+                        if (*m - ion).abs() <= tol { let y = *y as f64 * scale; v.push([*m, 0.0]); v.push([*m, y]); v.push([*m, 0.0]); }
+                    }
+                    hl.push((k, ion, v));
                 }
-                hl.push((k, ion, v));
+            }
+            let top10 = top_peaks(&sp.mz, &sp.inten, 10);
+            if !hl.is_empty() {
+                ui.horizontal(|ui| {
+                    for (k, ion, v) in &hl {
+                        ui.colored_label(pal(*k), format!("■ target ion m/z {}{}", mz4(*ion), if v.is_empty() { " (not in this scan)" } else { "" }));
+                    }
+                });
+            }
+            let mut plot = mzplot!(Plot::new("spec").height(ui.available_height()).x_axis_label("m/z")
+                .y_axis_label(if norm { "Intensity (% of maximum)" } else { "Intensity" }), norm);
+            if self.spec_autofit { plot = plot.reset(); }
+            let pr = plot.show(ui, |pu| {
+                pu.line(Line::new(PlotPoints::from(all.clone())).color(Color32::GRAY));
+                for (k, ion, v) in &hl {
+                    pu.vline(VLine::new(*ion).color(pal(*k).gamma_multiply(0.5)));
+                    if !v.is_empty() { pu.line(Line::new(PlotPoints::from(v.clone())).color(pal(*k)).width(2.5_f32)); }
+                }
+                if capturing {
+                    // figure export: label the 10 most intense peaks with their m/z
+                    for (m, y) in &top10 {
+                        pu.text(Text::new(PlotPoint::new(*m, *y * scale),
+                            RichText::new(mz4(*m)).size(11.0).color(Color32::BLACK).background_color(Color32::from_rgba_unmultiplied(255, 255, 255, 215)))
+                            .anchor(egui::Align2::CENTER_BOTTOM));
+                    }
+                } else if let Some(p) = pu.pointer_coordinate() {
+                    // snap to the peak closest to the cursor and show only its RT and m/z
+                    let b = pu.plot_bounds();
+                    let (xw, yw) = (b.max()[0] - b.min()[0], b.max()[1] - b.min()[1]);
+                    if let Some((m, y)) = nearest_peak(&sp.mz, &sp.inten, scale, p.x, p.y, xw, yw) {
+                        let right = m > (b.min()[0] + b.max()[0]) / 2.0;
+                        pu.line(Line::new(PlotPoints::from(vec![[m, 0.0], [m, y]])).color(Color32::WHITE).width(3.0_f32));
+                        pu.points(Points::new(vec![[m, y]]).radius(5.0_f32).color(Color32::WHITE));
+                        pu.text(Text::new(PlotPoint::new(m, y),
+                            RichText::new(format!("RT {:.2} min\nm/z {}", rt_scan, mz4(m))).color(Color32::WHITE).background_color(Color32::from_black_alpha(200)))
+                            .anchor(if right { egui::Align2::RIGHT_BOTTOM } else { egui::Align2::LEFT_BOTTOM }));
+                    }
+                }
+            });
+            let rect = pr.response.rect;
+            let (x0, x1, y0, y1) = { let b = pr.transform.bounds(); (b.min()[0], b.max()[0], b.min()[1], b.max()[1]) };
+            let names = vec!["MS2 spectrum (m/z, Intensity)".to_string()];
+            let mut ex: Option<ExportKind> = None;
+            export_menu!(pr.response, "MS2 spectrum", ex, &names);
+            if let Some(k) = ex {
+                let stem = format!("MS2_scan_{}_{}", sp.scan, safe_name(&sm.data.name));
+                match k {
+                    ExportKind::Csv(_) => {
+                        csv_req = Some((stem, csv_two("m/z", "Intensity", sp.mz.iter().cloned().zip(sp.inten.iter().map(|&v| v as f64)))));
+                    }
+                    _ => {
+                        let mut ss = vec![SvgSeries { name: "peaks".into(), rgb: (128, 128, 128), width: 1.0, points: all.clone() }];
+                        let mut vl = vec![];
+                        for (ci, ion, v) in &hl {
+                            if !v.is_empty() { ss.push(SvgSeries { name: format!("target ion m/z {}", mz4(*ion)), rgb: color_rgb(pal(*ci)), width: 2.0, points: v.clone() }); }
+                            vl.push(SvgVLine { x: *ion, rgb: color_rgb(pal(*ci)), label: String::new() });
+                        }
+                        let labels: Vec<SvgLabel> = top10.iter().map(|(m, y)| SvgLabel { x: *m, y: *y * scale, text: mz4(*m), rgb: (0, 0, 0) }).collect();
+                        let yf: fn(f64) -> String = if norm { pct0 } else { sci3 };
+                        export_req = Some((k, SvgPlot {
+                            title: head.clone(), x_label: "m/z".into(),
+                            y_label: if norm { "Intensity (% of maximum)".into() } else { "Intensity".into() },
+                            series: ss, vlines: vl, labels, bounds: [x0, x1, y0, y1], x_fmt: mz4, y_fmt: yf,
+                        }, rect, stem));
+                    }
+                }
             }
         }
-        let mut plot = mzplot!(Plot::new("spec").height(ui.available_height()).legend(Legend::default()).x_axis_label("m/z")
-            .y_axis_label(if norm { "Intensity (% of maximum)" } else { "Intensity" }), norm);
-        if self.spec_autofit { plot = plot.reset(); }
-        let pr = plot.show(ui, |pu| {
-            pu.line(Line::new(PlotPoints::from(all.clone())).color(Color32::GRAY).name("peaks"));
-            for (k, ion, v) in &hl {
-                pu.vline(VLine::new(*ion).color(pal(*k).gamma_multiply(0.5)));
-                if !v.is_empty() { pu.line(Line::new(PlotPoints::from(v.clone())).color(pal(*k)).width(2.5_f32).name(format!("target ion m/z {}", mz4(*ion)))); }
-            }
-        });
-        let rect = pr.response.rect;
-        let (x0, x1, y0, y1) = { let b = pr.transform.bounds(); (b.min()[0], b.max()[0], b.min()[1], b.max()[1]) };
-        let mut ex: Option<ExportKind> = None;
-        export_menu!(pr.response, "MS2 spectrum", ex);
-        if let Some(k) = ex {
-            let mut ss = vec![SvgSeries { name: "peaks".into(), rgb: (128, 128, 128), width: 1.0, points: all.clone() }];
-            let mut vl = vec![];
-            for (ci, ion, v) in &hl {
-                if !v.is_empty() { ss.push(SvgSeries { name: format!("target ion m/z {}", mz4(*ion)), rgb: color_rgb(pal(*ci)), width: 2.0, points: v.clone() }); }
-                vl.push(SvgVLine { x: *ion, rgb: color_rgb(pal(*ci)), label: String::new() });
-            }
-            let yf: fn(f64) -> String = if norm { pct0 } else { sci };
-            let plot = SvgPlot {
-                title: head.clone(), x_label: "m/z".into(), y_label: if norm { "Intensity (% of maximum)".into() } else { "Intensity".into() },
-                series: ss, vlines: vl, bounds: [x0, x1, y0, y1], x_fmt: mz4, y_fmt: yf,
-            };
-            let stem = format!("ms2_scan_{}_{}", sp.scan, safe_name(&sm.data.name));
-            self.do_export(k, plot, rect, &stem);
-        }
+        if let Some((k, plot, rect, stem)) = export_req { self.do_export(k, plot, rect, &stem); }
+        if let Some((stem, text)) = csv_req { self.save_csv(&stem, &text); }
     }
 
     /// Asks for a file name, then writes the SVG at once or schedules a PNG capture of the plot rectangle.
@@ -1776,14 +2028,25 @@ impl App {
         if let Some(dir) = Path::new(&self.out_path).parent() { if dir.is_dir() { d = d.set_directory(dir); } }
         let path = match d.save_file() { Some(p) => p, None => return };
         match kind {
-            ExportKind::Svg => match std::fs::write(&path, svg::render(&plot)) {
-                Ok(_) => { self.audit.log("FIGURE_EXPORTED", &format!("{} ({})", path.display(), plot.title)); self.status = format!("Saved {}", path.display()); }
-                Err(e) => self.status = format!("Saving the figure failed: {}", e),
-            },
             ExportKind::Png => {
                 self.status = format!("Capturing the plot to {} ...", path.display());
                 self.capture = Some(Capture { rect, path, frames: 3, sent: false });
             }
+            _ => match std::fs::write(&path, svg::render(&plot)) {
+                Ok(_) => { self.audit.log("FIGURE_EXPORTED", &format!("{} ({})", path.display(), plot.title)); self.status = format!("Saved {}", path.display()); }
+                Err(e) => self.status = format!("Saving the figure failed: {}", e),
+            },
+        }
+    }
+
+    /// Two-column data export (RT/Intensity or m/z/Intensity); the suggested name says what is exported.
+    fn save_csv(&mut self, stem: &str, text: &str) {
+        let mut d = rfd::FileDialog::new().set_title("Save data as CSV").add_filter("CSV", &["csv"]).set_file_name(format!("{}.csv", stem));
+        if let Some(dir) = Path::new(&self.out_path).parent() { if dir.is_dir() { d = d.set_directory(dir); } }
+        let path = match d.save_file() { Some(p) => p, None => return };
+        match std::fs::write(&path, text) {
+            Ok(_) => { self.audit.log("DATA_EXPORTED", &path.display().to_string()); self.status = format!("Saved {}", path.display()); }
+            Err(e) => self.status = format!("Saving the data failed: {}", e),
         }
     }
 
@@ -1803,6 +2066,187 @@ impl App {
             },
             Err(e) => self.status = format!("PNG encoding failed: {}", e),
         }
+    }
+
+    /// Sets the sample type. If `file` is one of several selected files, ALL selected files get the type; otherwise only `file`.
+    fn set_type(&mut self, file: usize, kind: Kind) {
+        if file >= self.samples.len() { return; }
+        let group: Vec<usize> = if self.samples[file].show && self.shown().len() > 1 { self.shown() } else { vec![file] };
+        if group.iter().all(|&f| self.samples[f].kind == kind) { return; }
+        self.push_undo("sample type");
+        for &f in &group { self.samples[f].kind = kind; }
+        for a in 0..self.analytes.len() { self.refit(a); }
+        let names: Vec<String> = group.iter().map(|&f| self.samples[f].data.name.clone()).collect();
+        self.audit.log("SAMPLE_TYPE", &format!("type={} files={}", kind.label(), names.join(",")));
+        if group.len() > 1 { self.status = format!("{} selected files set to {}", group.len(), kind.label()); }
+    }
+
+    // ---------------- calibration setup (standards per target, replicates) ----------------
+    /// Gives every selected file the concentration `conc` for `target` (conc = 0 removes it) and marks them as standards.
+    fn assign_standards(&mut self, target: usize, conc: f64) {
+        let files = self.shown();
+        if files.is_empty() || target >= self.analytes.len() { return; }
+        self.push_undo(if conc > 0.0 { "assign standards" } else { "remove concentrations" });
+        for &f in &files {
+            let sm = &mut self.samples[f];
+            if let Some(c) = sm.cells.get_mut(target) { c.conc = conc; }
+            if conc > 0.0 { sm.kind = Kind::Standard; }
+        }
+        self.refit(target);
+        let names: Vec<String> = files.iter().map(|&f| self.samples[f].data.name.clone()).collect();
+        self.audit.log("STANDARDS_ASSIGNED", &format!("target={} conc={} files={}", self.analytes[target].name, conc, names.join(",")));
+        self.status = format!("{} file(s): {} = {} {}", files.len(), self.analytes[target].name, sci(conc), self.units);
+    }
+
+    fn ui_setup(&mut self, ui: &mut egui::Ui) {
+        if self.analytes.is_empty() { ui.label("Load a target table first."); return; }
+        ui.heading("Calibration setup");
+        ui.weak("Each target has its own calibration. A standard file carries a concentration per target (blank = not a standard for that target). \
+                 Replicates simply share the same concentration; all replicates are used unless you exclude one in the calibration table (Chromatograms tab).");
+        if self.assign_target >= self.analytes.len() { self.assign_target = 0; }
+        let n_sel = self.shown().len();
+        let (mut assign, mut clear) = (false, false);
+        ui.horizontal(|ui| {
+            ui.label(format!("{} selected file(s) →", n_sel));
+            ui.label("target");
+            egui::ComboBox::new("assign_t", "").selected_text(self.analytes[self.assign_target].name.clone()).show_ui(ui, |ui| {
+                for i in 0..self.analytes.len() { let n = self.analytes[i].name.clone(); ui.selectable_value(&mut self.assign_target, i, n); }
+            });
+            ui.label("concentration");
+            ui.add(dv(&mut self.assign_conc).speed(0.1).range(0.0..=1e9));
+            ui.label(self.units.clone());
+            if ui.add_enabled(n_sel > 0 && self.assign_conc > 0.0, egui::Button::new("Assign as standards")).clicked() { assign = true; }
+            if ui.add_enabled(n_sel > 0, egui::Button::new("Remove concentration")).clicked() { clear = true; }
+        });
+        ui.weak("Changing the type of a file that is part of a multi-selection sets all selected files to that type.");
+        ui.weak("Tip: select the replicate files in the sample list (Ctrl/Shift+click), pick the target and the level, press Assign; repeat for the next level.");
+        if assign { self.assign_standards(self.assign_target, self.assign_conc); }
+        if clear { self.assign_standards(self.assign_target, 0.0); }
+        ui.separator();
+        let (na, ns) = (self.analytes.len(), self.samples.len());
+        let mut change: Option<(usize, usize, f64)> = None;
+        let mut kind_change: Option<(usize, Kind)> = None;
+        egui::ScrollArea::both().id_salt("setup").show(ui, |ui| {
+            egui::Grid::new("setupgrid").striped(true).show(ui, |ui| {
+                ui.strong("File"); ui.strong("Type");
+                for an in &self.analytes { ui.strong(format!("{} ({})", an.name, self.units)); }
+                ui.end_row();
+                for s in 0..ns {
+                    ui.label(&self.samples[s].data.name);
+                    let mut k = self.samples[s].kind;
+                    egui::ComboBox::new(("setupkind", s), "").selected_text(k.label()).show_ui(ui, |ui| {
+                        for kk in Kind::ALL { ui.selectable_value(&mut k, kk, kk.label()); }
+                    });
+                    if k != self.samples[s].kind { kind_change = Some((s, k)); }
+                    for a in 0..na {
+                        let old = self.samples[s].cells.get(a).map(|c| c.conc).unwrap_or(0.0);
+                        let mut v = old;
+                        if ui.add(dv_conc(&mut v).speed(0.1).range(0.0..=1e9)).changed() && v != old { change = Some((s, a, v)); }
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        let dragging = ui.ctx().input(|i| i.pointer.any_down());
+        if let Some((s, a, v)) = change {
+            if !(dragging && self.last_undo_label == "concentration") { self.push_undo("concentration"); }
+            if let Some(c) = self.samples[s].cells.get_mut(a) { c.conc = v; }
+            if v > 0.0 && self.samples[s].kind == Kind::Unknown { self.samples[s].kind = Kind::Standard; }
+            self.refit(a);
+            self.audit.log("CONCENTRATION_SET", &format!("file={} target={} conc={}", self.samples[s].data.name, self.analytes[a].name, v));
+        }
+        if let Some((s, k)) = kind_change { self.set_type(s, k); }
+    }
+
+    // ---------------- preferences ----------------
+    fn ui_prefs(&mut self, ctx: &egui::Context) {
+        if !self.show_prefs { return; }
+        let mut open = true;
+        let (mut browse, mut test, mut save) = (false, false, false);
+        egui::Window::new("Preferences").open(&mut open).default_width(660.0).show(ctx, |ui| {
+            ui.heading("Thermo .raw reader");
+            ui.label("ThermoRawFileParser is only needed for Thermo .raw files; mzML files are read directly.");
+            ui.horizontal(|ui| {
+                let r = ui.add(egui::TextEdit::singleline(&mut self.trfp_path).desired_width(430.0)
+                    .hint_text("path to ThermoRawFileParser.exe (empty = search automatically)"));
+                if r.lost_focus() { save = true; }
+                if ui.button("Browse…").clicked() { browse = true; }
+                if ui.button("Test").clicked() { test = true; }
+            });
+            match rawconv::find_trfp(&self.trfp_path) {
+                Some(p) => { ui.colored_label(Color32::GREEN, format!("found: {}", p.display())); }
+                None => { ui.colored_label(Color32::RED, "not found"); }
+            }
+            ui.separator();
+            ui.heading("Projects");
+            ui.checkbox(&mut self.embed_raw, "Embed raw files when saving projects");
+        });
+        let was_open = self.show_prefs;
+        self.show_prefs = open;
+        if browse {
+            if let Some(p) = rfd::FileDialog::new().set_title("Locate ThermoRawFileParser").add_filter("ThermoRawFileParser", &["exe", "dll"]).pick_file() {
+                self.trfp_path = p.to_string_lossy().to_string();
+                save = true;
+            }
+        }
+        if save { self.save_trfp(); }
+        if test {
+            self.status = match rawconv::find_trfp(&self.trfp_path) {
+                Some(p) => match rawconv::converter_version(&p) {
+                    Ok(v) => format!("ThermoRawFileParser works: {}", v),
+                    Err(e) => format!("ThermoRawFileParser test failed: {}", e),
+                },
+                None => "ThermoRawFileParser not found".into(),
+            };
+        }
+        if was_open && !open { self.write_settings(); }
+    }
+
+    // ---------------- mzML import and quick XIC ----------------
+    fn start_load_any(&mut self, ctx: &egui::Context, path: &str) -> bool {
+        if path.to_lowercase().ends_with(".mzml") { self.start_load_mzml(ctx, path) } else { self.start_load(ctx, path) }
+    }
+
+    /// mzML files (from any vendor, e.g. converted with ProteoWizard msconvert) are parsed directly, in memory.
+    fn start_load_mzml(&mut self, ctx: &egui::Context, path: &str) -> bool {
+        let p = PathBuf::from(path);
+        if !p.is_file() { self.status = format!("File not found: {}", path); return false; }
+        self.loading += 1;
+        self.status = format!("Reading {} (held in memory only)...", path);
+        let (tx, ctx, ps) = (self.tx.clone(), ctx.clone(), path.to_string());
+        std::thread::spawn(move || {
+            match std::fs::read(&p) {
+                Ok(bytes) => {
+                    let name = p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+                    match mzml::parse_bytes(&name, &bytes) {
+                        Ok(d) => {
+                            let h = d.sha256.clone();
+                            let _ = tx.send(Msg::Loaded(d, LoadInfo { path: ps, raw_sha: h, detail: "format=mzML (no converter)".into(), source: RawSource::Disk(p.clone()) }));
+                        }
+                        Err(e) => { let _ = tx.send(Msg::Err(e)); }
+                    }
+                }
+                Err(e) => { let _ = tx.send(Msg::Err(format!("{}: {}", ps, e))); }
+            }
+            let _ = tx.send(Msg::Finished);
+            ctx.request_repaint();
+        });
+        true
+    }
+
+    /// Turns the m/z of the "custom m/z" view into a permanent target (MS2 level: product ion, MS1 level: precursor).
+    fn add_quick_target(&mut self) {
+        let mz = self.quick_mz;
+        if mz <= 0.0 { return; }
+        self.push_undo("add target");
+        let n = self.analytes.len();
+        let prec = if self.quick_level == 1 { Some(mz) } else { None };
+        self.analytes.push(Analyte { name: format!("m/z {}", mz4(mz)), rt: None, ions: vec![mz], precursor: prec });
+        self.fits.push(None);
+        self.recompute_analyte(n);
+        self.rows_dirty = true;
+        self.audit.log("TARGET_ADDED", &format!("#{} from quick XIC m/z {} MS{}", n + 1, mz4(mz), self.quick_level));
+        self.status = format!("Added target m/z {} - edit its name and RT in Edit → Target table", mz4(mz));
     }
 }
 
@@ -1886,15 +2330,6 @@ impl eframe::App for App {
                 if ui.button("Export CSV").clicked() {
                     self.status = match self.export() { Ok(_) => format!("Exported {}", self.out_path), Err(e) => format!("Export failed: {}", e) };
                 }
-                ui.separator();
-                ui.label("ThermoRawFileParser.exe:");
-                let r = ui.add(egui::TextEdit::singleline(&mut self.trfp_path).desired_width(260.0)
-                    .hint_text(r"C:\Tools\ThermoRawFileParser\ThermoRawFileParser.exe"));
-                if r.lost_focus() { self.save_trfp(); }
-                if !self.trfp_path.trim().is_empty() {
-                    if Path::new(self.trfp_path.trim().trim_matches('"')).is_file() { ui.colored_label(Color32::GREEN, "found"); }
-                    else { ui.colored_label(Color32::RED, "not found"); }
-                }
                 if self.loading > 0 || self.saving > 0 { ui.spinner(); }
             });
             ui.horizontal(|ui| {
@@ -1958,9 +2393,8 @@ impl eframe::App for App {
                 if ui.small_button("Select all").clicked() { for s in self.samples.iter_mut() { s.show = true; } }
                 if ui.small_button("Select none").clicked() { for s in self.samples.iter_mut() { s.show = false; } }
             });
-            ui.weak("Click = select · Ctrl+click = add/remove · Shift+click = range · right-click = menu");
-            let before: Vec<(Kind, f64)> = self.samples.iter().map(|s| (s.kind, s.conc)).collect();
-            let mut changed = false;
+            ui.weak("Click = select · Ctrl+click = add/remove · Shift+click = range · right-click = menu · changing the type of a selected file changes all selected files");
+            let mut kind_set: Option<(usize, Kind)> = None;
             let mut click: Option<(usize, bool, bool)> = None;
             let mut remove: Option<usize> = None;
             let mut set_ref: Option<usize> = None;
@@ -1976,25 +2410,16 @@ impl eframe::App for App {
                             if ui.button("Select only this file").clicked() { click = Some((i, false, false)); ui.close_menu(); }
                             if ui.button("Use as alignment reference").clicked() { set_ref = Some(i); ui.close_menu(); }
                         });
+                        let mut kk = s.kind;
                         egui::ComboBox::new(("kind", i), "").selected_text(s.kind.label()).show_ui(ui, |ui| {
-                            for k in Kind::ALL { changed |= ui.selectable_value(&mut s.kind, k, k.label()).changed(); }
+                            for k in Kind::ALL { ui.selectable_value(&mut kk, k, k.label()); }
                         });
-                        if self.mode == Mode::Curve && s.kind == Kind::Standard { changed |= ui.add(dv(&mut s.conc).speed(0.1).range(0.0..=1e9)).changed(); }
+                        if kk != s.kind { kind_set = Some((i, kk)); }
                         if s.rt_shift != 0.0 { ui.weak(format!("Δ{:+.2} min", s.rt_shift)); }
                     });
                 }
             });
-            if changed {
-                let dragging = ctx.input(|i| i.pointer.any_down());
-                if !(dragging && self.last_undo_label == "sample assignment") {
-                    let mut snap = self.snapshot("sample assignment");
-                    for (st, (k, c)) in snap.samples.iter_mut().zip(before.iter()) { st.kind = *k; st.conc = *c; }
-                    self.history.record(snap);
-                    self.last_undo_label = "sample assignment".into();
-                }
-                for a in 0..self.analytes.len() { self.refit(a); }
-                self.audit.log("SAMPLE_ASSIGNMENT", &self.samples.iter().map(|s| format!("{}={}@{}", s.data.name, s.kind.label(), s.conc)).collect::<Vec<_>>().join(" ; "));
-            }
+            if let Some((i, k)) = kind_set { self.set_type(i, k); }
             if let Some((i, ctrl, shift)) = click { self.apply_click(i, ctrl, shift); }
             if let Some(i) = set_ref { self.align_ref = i; self.audit.log("ALIGN_REFERENCE", &self.samples[i].data.name); }
             if let Some(i) = remove { self.remove_sample(i); }
@@ -2006,22 +2431,24 @@ impl eframe::App for App {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             if self.samples.is_empty() {
-                ui.heading("Drop Thermo .raw files (and optionally a .csv target table: name, RT|n/a, ion m/z values) onto this window.");
+                ui.heading("Drop Thermo .raw or mzML files (and optionally a .csv target table: name, RT|n/a, ion m/z values) onto this window.");
                 ui.label("Or use File → Import / Open. Files are read via ThermoRawFileParser and kept in memory only; no converted files are written to disk.");
                 return;
             }
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.tab, Tab::Chrom, "Chromatograms");
                 ui.selectable_value(&mut self.tab, Tab::Matrix, "Results matrix (all files)");
+                ui.selectable_value(&mut self.tab, Tab::Setup, "Calibration setup");
             });
             ui.separator();
             let prev_hover = self.hover;
             self.hover = None;
-            match self.tab { Tab::Chrom => self.ui_chrom(ui), Tab::Matrix => self.ui_matrix(ui) }
+            match self.tab { Tab::Chrom => self.ui_chrom(ui), Tab::Matrix => self.ui_matrix(ui), Tab::Setup => self.ui_setup(ui) }
             if self.hover != prev_hover { ui.ctx().request_repaint(); }
         });
 
         self.ui_targets_window(ctx);
+        self.ui_prefs(ctx);
         if self.show_credits {
             let mut open = true;
             egui::Window::new("Credits & third-party software").open(&mut open).default_width(640.0).show(ctx, |ui| { ui.label(CREDITS); });
@@ -2154,7 +2581,7 @@ mod tests {
         for (i, s) in [1.0, 2.0, 4.0, 8.0].iter().enumerate() {
             add(&mut a, i, 0.0, *s);
             a.samples[i].kind = Kind::Standard;
-            a.samples[i].conc = *s;
+            a.samples[i].cells[0].conc = *s;
         }
         add(&mut a, 9, 0.0, 3.0);
         for k in 0..a.analytes.len() { a.refit(k); }
@@ -2204,7 +2631,7 @@ mod tests {
         targets(&mut a);
         add(&mut a, 0, 0.0, 1.0);
         a.samples[0].kind = Kind::Standard;
-        a.samples[0].conc = 5.0;
+        a.samples[0].cells[0].conc = 5.0;
         a.apply_edit(0, 0, 4.9, 5.1);
         a.commit(0, 0);
         let pf = a.project_file();
@@ -2294,5 +2721,132 @@ mod tests {
     #[test]
     fn spectrum_panel_does_not_follow_hover_by_default() {
         assert!(!app().follow_hover);
+    }
+
+    #[test]
+    fn several_targets_each_have_their_own_standards_and_replicates() {
+        let mut a = app();
+        a.analytes = parse_table("name,rt,ions\nMorph,5.0,150\nFent,5.0,250\n").unwrap();
+        a.recompute_all();
+        // Morph standards: levels 1, 2, 2 (replicate), 4;  Fent standards: levels 1, 2, 4;  one unknown with scale 3
+        let morph = [1.0, 2.0, 2.0, 4.0];
+        let fent = [1.0, 2.0, 4.0];
+        for (i, s) in morph.iter().enumerate() { add(&mut a, i, 0.0, *s); a.samples[i].cells[0].conc = *s; a.samples[i].kind = Kind::Standard; }
+        for (j, s) in fent.iter().enumerate() { let i = morph.len() + j; add(&mut a, i, 0.0, *s); a.samples[i].cells[1].conc = *s; a.samples[i].kind = Kind::Standard; }
+        let u = morph.len() + fent.len();
+        add(&mut a, u, 0.0, 3.0);
+        for k in 0..2 { a.refit(k); }
+        assert_eq!(a.fits[0].unwrap().n, 4, "all Morph replicates are used by default");
+        assert_eq!(a.fits[1].unwrap().n, 3, "Fent standards do not leak into the Morph curve and vice versa");
+        let (cm, cf) = (a.conc_of(u, 0).unwrap(), a.conc_of(u, 1).unwrap());
+        assert!((cm - 3.0).abs() / 3.0 < 0.02, "Morph {}", cm);
+        assert!((cf - 3.0).abs() / 3.0 < 0.02, "Fent {}", cf);
+        // exclude one replicate of the level-2 pair
+        a.samples[2].cells[0].include = false;
+        a.refit(0);
+        assert_eq!(a.fits[0].unwrap().n, 3);
+        let c2 = a.conc_of(u, 0).unwrap();
+        assert!((c2 - 3.0).abs() / 3.0 < 0.02);
+        assert_eq!(a.fits[1].unwrap().n, 3, "other target unaffected");
+    }
+
+    #[test]
+    fn assigning_a_replicate_group_with_one_action() {
+        let mut a = app();
+        a.analytes = parse_table("name,rt,ions\nMorph,5.0,150\nFent,5.0,250\n").unwrap();
+        a.recompute_all();
+        for i in 0..4 { add(&mut a, i, 0.0, 1.0 + i as f64); }
+        a.apply_click(0, false, false);
+        a.apply_click(2, false, true); // files 0..=2
+        a.assign_standards(1, 10.0);
+        for i in 0..3 { assert!(a.samples[i].kind == Kind::Standard && a.samples[i].cells[1].conc == 10.0 && a.samples[i].cells[0].conc == 0.0); }
+        assert!(a.samples[3].kind == Kind::Unknown && a.samples[3].cells[1].conc == 0.0);
+        a.undo();
+        assert!(a.samples[0].kind == Kind::Unknown && a.samples[0].cells[1].conc == 0.0);
+    }
+
+    #[test]
+    fn concentrations_survive_a_project_round_trip_and_old_projects_load() {
+        let mut a = app();
+        targets(&mut a);
+        add(&mut a, 0, 0.0, 1.0);
+        a.samples[0].cells[0].conc = 7.5;
+        let pf = a.project_file();
+        let back = ProjectFile::parse(&pf.to_text()).unwrap();
+        assert_eq!(back.samples[0].cells[0].conc, Some(7.5));
+        let old = pf.to_text().replace("\ttrue\t7.5\n", "\ttrue\n");
+        assert_eq!(ProjectFile::parse(&old).unwrap().samples[0].cells[0].conc, None, "older projects have no per-target concentration");
+    }
+
+    #[test]
+    fn quick_xic_traces_a_custom_mz_without_a_target() {
+        let mut a = app();
+        add(&mut a, 0, 0.0, 2.0);
+        a.quick_mz = testkit::FRAG1;
+        a.quick_level = 2;
+        let x = a.quick_trace(0);
+        let apex = x.iter().cloned().fold([0.0, 0.0], |m, p| if p[1] > m[1] { p } else { m });
+        assert!((apex[0] - 5.0).abs() < 0.02 && (apex[1] - 2000.0).abs() < 25.0, "{:?}", apex);
+        a.quick_mz = 500.0;
+        a.quick_level = 1;
+        assert!(a.quick_trace(0).iter().any(|p| p[1] > 40000.0), "MS1 trace of the MS1 ion");
+        let before = a.analytes.len();
+        a.add_quick_target();
+        assert_eq!(a.analytes.len(), before + 1);
+        assert_eq!(a.analytes[before].precursor, Some(500.0));
+        assert!(a.samples[0].cells.len() == a.analytes.len());
+    }
+
+    #[test]
+    fn precursor_of_each_ms2_scan_is_available() {
+        let mut a = app();
+        add(&mut a, 0, 0.0, 1.0);
+        let sp = &a.samples[0].data.spectra;
+        assert_eq!(sp[0].precursor, Some(testkit::PRECURSOR), "selected ion m/z wins over the isolation window target");
+        assert_eq!(prec_str(sp[0].precursor), "286.1438");
+        assert_eq!(prec_str(None), "n/a");
+        assert!(a.samples[0].data.ms1.iter().all(|s| s.precursor.is_none()));
+        assert!(scan_info(&a.samples[0].data, 2, 0).contains("precursor m/z 286.1438"));
+        assert!(scan_info(&a.samples[0].data, 1, 0).starts_with("MS1 scan"));
+    }
+
+    #[test]
+    fn cursor_snaps_to_the_nearest_peak_and_top_peaks_are_ranked() {
+        let (mz, inten) = (vec![100.0, 150.0, 200.0, 250.0], vec![10.0f32, 100.0, 50.0, 70.0]);
+        let (xw, yw) = (200.0, 100.0);
+        assert_eq!(nearest_peak(&mz, &inten, 1.0, 151.0, 50.0, xw, yw), Some((150.0, 100.0)));
+        assert_eq!(nearest_peak(&mz, &inten, 1.0, 197.0, 60.0, xw, yw), Some((200.0, 50.0)));
+        assert_eq!(nearest_peak(&mz, &inten, 0.5, 250.0, 10.0, xw, yw), Some((250.0, 35.0)), "scaled intensity is returned");
+        assert_eq!(nearest_peak(&mz, &inten, 1.0, 900.0, 10.0, xw, yw), None, "nothing near the cursor");
+        let t = top_peaks(&mz, &inten, 3);
+        assert_eq!(t.iter().map(|p| p.0).collect::<Vec<_>>(), vec![150.0, 250.0, 200.0]);
+        assert_eq!(top_peaks(&mz, &inten, 10).len(), 4);
+    }
+
+    #[test]
+    fn changing_the_type_of_a_selected_file_changes_all_selected_files() {
+        let mut a = app();
+        for i in 0..5 { add(&mut a, i, 0.0, 1.0); }
+        a.apply_click(1, false, false);
+        a.apply_click(3, false, true); // files 1..=3 selected
+        assert_eq!(a.shown(), vec![1, 2, 3]);
+        a.set_type(2, Kind::Standard);
+        let kinds: Vec<bool> = a.samples.iter().map(|s| s.kind == Kind::Standard).collect();
+        assert_eq!(kinds, vec![false, true, true, true, false], "only the selected files change");
+        // a file outside the selection changes alone
+        a.set_type(4, Kind::Blank);
+        assert!(a.samples[4].kind == Kind::Blank && a.samples[1].kind == Kind::Standard);
+        // one single selected file changes alone
+        a.apply_click(0, false, false);
+        a.set_type(0, Kind::QC);
+        assert!(a.samples[0].kind == Kind::QC && a.samples[2].kind == Kind::Standard);
+        // one undo step reverts the whole group
+        a.set_type(0, Kind::Unknown);
+        a.apply_click(1, false, false);
+        a.apply_click(3, false, true);
+        a.set_type(1, Kind::Unknown);
+        assert!(a.samples[1..=3].iter().all(|s| s.kind == Kind::Unknown));
+        a.undo();
+        assert!(a.samples[1..=3].iter().all(|s| s.kind == Kind::Standard), "undo restores the whole group at once");
     }
 }

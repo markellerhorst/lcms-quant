@@ -6,7 +6,11 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct CellRec { pub analyte: usize, pub found: bool, pub manual: bool, pub start: f64, pub end: f64, pub include: bool }
+pub struct CellRec {
+    pub analyte: usize, pub found: bool, pub manual: bool, pub start: f64, pub end: f64, pub include: bool,
+    /// standard concentration of this target in this file (0 = not a standard); None in projects written by older versions
+    pub conc: Option<f64>,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct SampleRec {
@@ -43,7 +47,7 @@ impl ProjectFile {
         for s in &self.samples {
             o += &format!("S\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", clean(&s.path), s.raw_sha256, clean(&s.kind), s.conc, s.rt_shift, s.show, s.embedded);
             for c in &s.cells {
-                o += &format!("C\t{}\t{}\t{}\t{}\t{}\t{}\n", c.analyte, c.found, c.manual, c.start, c.end, c.include);
+                o += &format!("C\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", c.analyte, c.found, c.manual, c.start, c.end, c.include, c.conc.map(|v| v.to_string()).unwrap_or_else(|| "-".into()));
             }
         }
         o
@@ -79,6 +83,7 @@ impl ProjectFile {
                         analyte: f[1].parse().map_err(|_| err("bad analyte index"))?, found: f[2] == "true", manual: f[3] == "true",
                         start: f[4].parse().map_err(|_| err("bad start"))?, end: f[5].parse().map_err(|_| err("bad end"))?,
                         include: f[6] == "true",
+                        conc: f.get(7).and_then(|s| s.parse().ok()),
                     });
                 }
                 _ => {} // unknown / empty lines are ignored (forward compatible)
@@ -209,4 +214,13 @@ pub fn extract_blob(project: &Path, offset: u64, len: u64, dest: &Path) -> Resul
     copy_exact(&mut f, len, &mut out, Some(&mut h))?;
     io(out.flush(), "writing")?;
     Ok(h.finish_hex())
+}
+
+/// Reads an embedded blob completely into memory (used for embedded mzML files, which need no converter).
+pub fn read_blob(project: &Path, offset: u64, len: u64) -> Result<Vec<u8>, String> {
+    let mut f = io(std::fs::File::open(project), &project.display().to_string())?;
+    io(f.seek(SeekFrom::Start(offset)), "seek")?;
+    let mut v = vec![0u8; len as usize];
+    io(f.read_exact(&mut v), "reading")?;
+    Ok(v)
 }

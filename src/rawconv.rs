@@ -99,3 +99,12 @@ pub fn convert_in_memory(exe: &Path, raw: &Path) -> Result<Converted, String> {
     let exe_hash = hash_file(exe).unwrap_or_else(|_| "n/a".into());
     Ok(Converted { mzml: o.stdout, detail: format!("converter_sha256={} converter_version=[{}] cmd=[{:?}]", exe_hash, version, cmd) })
 }
+
+/// Output of `ThermoRawFileParser -v` (used by the preferences "Test" button).
+pub fn converter_version(exe: &Path) -> Result<String, String> {
+    let o = base_cmd(exe).arg("-v").output().map_err(|e| format!("could not start {}: {}", exe.display(), e))?;
+    let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    if !out.is_empty() { return Ok(out); }
+    let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
+    if err.is_empty() { Err("no version output".into()) } else { Ok(err) }
+}

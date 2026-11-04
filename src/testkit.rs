@@ -5,6 +5,8 @@
 pub const FRAG1: f64 = 150.0;
 pub const FRAG2: f64 = 250.0; // always 0.5 x FRAG1
 pub const PEAK_RT: f64 = 5.0;
+/// precursor m/z written into every synthetic MS2 scan (isolation window target is deliberately different)
+pub const PRECURSOR: f64 = 286.1438;
 pub const PEAK_SIGMA: f64 = 0.05;
 
 /// Analytical peak area (intensity·seconds) of FRAG1 for a given scale.
@@ -45,7 +47,8 @@ pub fn zlib_stored(data: &[u8]) -> Vec<u8> {
 
 fn gauss(t: f64, c: f64, s: f64) -> f64 { (-0.5 * ((t - c) / s).powi(2)).exp() }
 
-fn spectrum(idx: usize, level: u8, rt_min: f64, secs: bool, mz: &[f64], inten: &[f32]) -> String {
+fn spectrum(idx: usize, level: u8, rt_min: f64, secs: bool, mz: &[f64], inten: &[f32], prec: Option<f64>) -> String {
+    let p = prec.map(|v| format!("<precursorList count=\"1\"><precursor><isolationWindow><cvParam cvRef=\"MS\" accession=\"MS:1000827\" name=\"isolation window target m/z\" value=\"286\"/></isolationWindow><selectedIonList count=\"1\"><selectedIon><cvParam cvRef=\"MS\" accession=\"MS:1000744\" name=\"selected ion m/z\" value=\"{}\"/></selectedIon></selectedIonList></precursor></precursorList>\n", v)).unwrap_or_default();
     let mzb: Vec<u8> = mz.iter().flat_map(|v| v.to_le_bytes()).collect();
     let inb: Vec<u8> = inten.iter().flat_map(|v| v.to_le_bytes()).collect();
     let time = if secs {
@@ -54,8 +57,8 @@ fn spectrum(idx: usize, level: u8, rt_min: f64, secs: bool, mz: &[f64], inten: &
         format!("<cvParam cvRef=\"MS\" accession=\"MS:1000016\" name=\"scan start time\" value=\"{}\" unitCvRef=\"UO\" unitAccession=\"UO:0000031\" unitName=\"minute\"/>", rt_min)
     };
     format!(
-        "<spectrum index=\"{i}\" id=\"scan={i}\" defaultArrayLength=\"{n}\">\n<cvParam cvRef=\"MS\" accession=\"MS:1000511\" name=\"ms level\" value=\"{l}\"/>\n<scanList count=\"1\"><scan>{t}</scan></scanList>\n<binaryDataArrayList count=\"2\">\n<binaryDataArray encodedLength=\"0\"><cvParam cvRef=\"MS\" accession=\"MS:1000523\" name=\"64-bit float\"/><cvParam cvRef=\"MS\" accession=\"MS:1000576\" name=\"no compression\"/><cvParam cvRef=\"MS\" accession=\"MS:1000514\" name=\"m/z array\"/><binary>{m}</binary></binaryDataArray>\n<binaryDataArray encodedLength=\"0\"><cvParam cvRef=\"MS\" accession=\"MS:1000521\" name=\"32-bit float\"/><cvParam cvRef=\"MS\" accession=\"MS:1000574\" name=\"zlib compression\"/><cvParam cvRef=\"MS\" accession=\"MS:1000515\" name=\"intensity array\"/><binary>{b}</binary></binaryDataArray>\n</binaryDataArrayList>\n</spectrum>\n",
-        i = idx, n = mz.len(), l = level, t = time, m = b64(&mzb), b = b64(&zlib_stored(&inb))
+        "<spectrum index=\"{i}\" id=\"scan={i}\" defaultArrayLength=\"{n}\">\n<cvParam cvRef=\"MS\" accession=\"MS:1000511\" name=\"ms level\" value=\"{l}\"/>\n<scanList count=\"1\"><scan>{t}</scan></scanList>\n{p}<binaryDataArrayList count=\"2\">\n<binaryDataArray encodedLength=\"0\"><cvParam cvRef=\"MS\" accession=\"MS:1000523\" name=\"64-bit float\"/><cvParam cvRef=\"MS\" accession=\"MS:1000576\" name=\"no compression\"/><cvParam cvRef=\"MS\" accession=\"MS:1000514\" name=\"m/z array\"/><binary>{m}</binary></binaryDataArray>\n<binaryDataArray encodedLength=\"0\"><cvParam cvRef=\"MS\" accession=\"MS:1000521\" name=\"32-bit float\"/><cvParam cvRef=\"MS\" accession=\"MS:1000574\" name=\"zlib compression\"/><cvParam cvRef=\"MS\" accession=\"MS:1000515\" name=\"intensity array\"/><binary>{b}</binary></binaryDataArray>\n</binaryDataArrayList>\n</spectrum>\n",
+        i = idx, n = mz.len(), l = level, t = time, p = p, m = b64(&mzb), b = b64(&zlib_stored(&inb))
     )
 }
 
@@ -66,11 +69,11 @@ pub fn synthetic_mzml(offset: f64, scale: f64) -> Vec<u8> {
     for k in 0..1000 {
         let rt = k as f64 * 0.01;
         let ms1 = 1000.0 + 50000.0 * gauss(rt, PEAK_RT + offset, 0.1) + 30000.0 * gauss(rt, 8.0 + offset, 0.1);
-        o += &spectrum(idx, 1, rt, true, &[500.0], &[ms1 as f32]);
+        o += &spectrum(idx, 1, rt, true, &[500.0], &[ms1 as f32], None);
         idx += 1;
         let rt2 = rt + 0.005;
         let f1 = scale * 1000.0 * gauss(rt2, PEAK_RT + offset, PEAK_SIGMA);
-        o += &spectrum(idx, 2, rt2, false, &[FRAG1, FRAG2, 400.0], &[f1 as f32, (0.5 * f1) as f32, 10.0]);
+        o += &spectrum(idx, 2, rt2, false, &[FRAG1, FRAG2, 400.0], &[f1 as f32, (0.5 * f1) as f32, 10.0], Some(PRECURSOR));
         idx += 1;
     }
     o += "</spectrumList></run></mzML>\n";

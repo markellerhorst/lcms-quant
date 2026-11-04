@@ -1,7 +1,14 @@
 //! Minimal in-memory mzML reader: MS1 and MS2 spectra (m/z, intensity, RT, scan number).
 use crate::{inflate::zlib_decompress, sha256::sha256_hex};
 
-pub struct Spectrum { pub rt: f64, pub scan: u32, pub mz: Vec<f64>, pub inten: Vec<f32> }
+pub struct Spectrum {
+    pub rt: f64,
+    pub scan: u32,
+    pub mz: Vec<f64>,
+    pub inten: Vec<f32>,
+    /// m/z of the fragmented precursor ion (MS2 only): selected ion m/z, else the isolation window target; None if not recorded
+    pub precursor: Option<f64>,
+}
 
 pub struct MzData {
     pub name: String,
@@ -60,7 +67,7 @@ fn scan_no(id: &str) -> Option<u32> {
     d.parse().ok()
 }
 
-struct Cur { level: u32, rt: f64, scan: u32, mz: Vec<f64>, inten: Vec<f32> }
+struct Cur { level: u32, rt: f64, scan: u32, mz: Vec<f64>, inten: Vec<f32>, prec: Option<f64>, iso: Option<f64> }
 
 fn finish(mut c: Cur) -> Option<Spectrum> {
     if c.mz.is_empty() || c.mz.len() != c.inten.len() { return None; }
@@ -70,7 +77,7 @@ fn finish(mut c: Cur) -> Option<Spectrum> {
         c.mz = p.iter().map(|x| x.0).collect();
         c.inten = p.iter().map(|x| x.1).collect();
     }
-    Some(Spectrum { rt: c.rt, scan: c.scan, mz: c.mz, inten: c.inten })
+    Some(Spectrum { rt: c.rt, scan: c.scan, mz: c.mz, inten: c.inten, precursor: c.prec.or(c.iso) })
 }
 
 pub fn parse_bytes(name: &str, bytes: &[u8]) -> Result<MzData, String> {
@@ -131,7 +138,7 @@ pub fn parse_bytes(name: &str, bytes: &[u8]) -> Result<MzData, String> {
                 "spectrum" if !selfc => {
                     n_total += 1;
                     let scan = attr(tag, "id").and_then(scan_no).unwrap_or(n_total as u32);
-                    cur = Some(Cur { level: 0, rt: 0.0, scan, mz: vec![], inten: vec![] });
+                    cur = Some(Cur { level: 0, rt: 0.0, scan, mz: vec![], inten: vec![], prec: None, iso: None });
                 }
                 "binaryDataArray" if !selfc => { in_bda = true; is64 = true; zlib = false; kind = 0; unsupported = false; }
                 "binary" if !selfc => { in_bin = true; bin.clear(); }
@@ -140,6 +147,8 @@ pub fn parse_bytes(name: &str, bytes: &[u8]) -> Result<MzData, String> {
                         let val = attr(tag, "value").unwrap_or("");
                         if !in_bda {
                             if acc == "MS:1000511" { c.level = val.parse().unwrap_or(0); }
+                            else if acc == "MS:1000744" { c.prec = val.parse().ok(); }
+                            else if acc == "MS:1000827" { c.iso = val.parse().ok(); }
                             else if acc == "MS:1000016" {
                                 let v: f64 = val.parse().unwrap_or(0.0);
                                 let sec = attr(tag, "unitAccession") == Some("UO:0000010") || attr(tag, "unitName") == Some("second");

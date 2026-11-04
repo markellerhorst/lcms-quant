@@ -1,6 +1,8 @@
 //! Vector export of a plot (chromatogram or MS2 spectrum) as a stand-alone SVG file.
 
 pub struct SvgSeries { pub name: String, pub rgb: (u8, u8, u8), pub width: f32, pub points: Vec<[f64; 2]> }
+/// Text label placed above a data point (e.g. the m/z of the most intense peaks of a spectrum).
+pub struct SvgLabel { pub x: f64, pub y: f64, pub text: String, pub rgb: (u8, u8, u8) }
 pub struct SvgVLine { pub x: f64, pub rgb: (u8, u8, u8), pub label: String }
 
 pub struct SvgPlot {
@@ -9,6 +11,7 @@ pub struct SvgPlot {
     pub y_label: String,
     pub series: Vec<SvgSeries>,
     pub vlines: Vec<SvgVLine>,
+    pub labels: Vec<SvgLabel>,
     /// visible range: [x_min, x_max, y_min, y_max]
     pub bounds: [f64; 4],
     pub x_fmt: fn(f64) -> String,
@@ -37,7 +40,7 @@ fn esc(s: &str) -> String {
 pub fn render(p: &SvgPlot) -> String {
     const W: f64 = 1200.0;
     const H: f64 = 620.0;
-    let (l, r, t, b) = (100.0, 280.0, 50.0, 70.0);
+    let (l, r, t, b) = (130.0, 280.0, 50.0, 70.0);
     let (pw, ph) = (W - l - r, H - t - b);
     let [x0, mut x1, y0, mut y1] = p.bounds;
     if !(x1 > x0) { x1 = x0 + 1.0; }
@@ -74,8 +77,11 @@ pub fn render(p: &SvgPlot) -> String {
         s += &format!("<path d=\"{}\" stroke=\"{}\" stroke-width=\"{}\" stroke-linejoin=\"round\"/>\n", d.trim_end(), col(sr.rgb), sr.width);
     }
     s += "</g>\n";
+    for lb in &p.labels {
+        s += &format!("<text x=\"{:.2}\" y=\"{:.2}\" text-anchor=\"middle\" font-size=\"11\" fill=\"{}\">{}</text>\n", fx(lb.x), fy(lb.y) - 5.0, col(lb.rgb), esc(&lb.text));
+    }
     s += &format!("<text x=\"{:.2}\" y=\"{:.2}\" text-anchor=\"middle\" font-size=\"14\">{}</text>\n", l + pw / 2.0, H - 18.0, esc(&p.x_label));
-    s += &format!("<text transform=\"translate(24,{:.2}) rotate(-90)\" text-anchor=\"middle\" font-size=\"14\">{}</text>\n", t + ph / 2.0, esc(&p.y_label));
+    s += &format!("<text transform=\"translate(26,{:.2}) rotate(-90)\" text-anchor=\"middle\" font-size=\"14\">{}</text>\n", t + ph / 2.0, esc(&p.y_label));
     let mut ly = t + 12.0;
     let lx = l + pw + 20.0;
     for sr in p.series.iter().take(30) {

@@ -1,6 +1,6 @@
 //! Unit/integration tests for the non-GUI core. Run: cargo test
 use lcms_quant::{
-    audit, fmt::{mz4, parse_sci, pct0, rt2, sci, sci_prec}, png, svg, history::History, icon, inflate::zlib_decompress, mzml, project::*, quant::*, sha256::*, testkit,
+    audit, fmt::{mz4, parse_sci, pct0, rt2, sci, sci3, sci_prec}, png, svg, history::History, icon, inflate::zlib_decompress, mzml, project::*, quant::*, sha256::*, testkit,
 };
 
 // ---------- hashing ----------
@@ -73,6 +73,7 @@ fn retention_times_use_two_decimals_and_mz_keeps_its_digits() {
     assert_eq!(mz4(286.14384), "286.1438");
     assert_eq!(mz4(150.0), "150.0000");
     assert_eq!(mz4(1234.56789), "1234.5679", "plain rounding, never scientific notation");
+    assert_eq!(sci3(1234567.0), "1.23×10⁶", "compact axis ticks");
     assert_eq!(pct0(40.0), "40%");
     assert_eq!(pct0(100.0), "100%");
 }
@@ -133,6 +134,8 @@ fn mzml_parsing_of_synthetic_run() {
     assert_eq!(d.sha256.len(), 64);
     assert_eq!(d.ms1.len(), 1000, "MS1 spectra are kept for MS1-based quantification");
     assert_eq!(d.ms1[3].mz, vec![500.0]);
+    assert_eq!(d.spectra[0].precursor, Some(testkit::PRECURSOR), "selected ion m/z is preferred over the isolation window target (286)");
+    assert!(d.ms1.iter().all(|s| s.precursor.is_none()), "MS1 scans have no precursor");
     assert_eq!((d.ms1[0].scan, d.spectra[0].scan, d.spectra[1].scan), (0, 1, 3), "scan numbers come from the spectrum id");
     assert!((d.spectra[10].rt - 0.105).abs() < 1e-9, "minute unit");
     assert!((d.tic1[10][0] - 0.1).abs() < 1e-9, "second unit converted to minutes");
@@ -242,8 +245,8 @@ fn project_file_round_trip() {
         analytes: vec![Analyte { name: "A".into(), rt: None, ions: vec![100.5, 200.25], precursor: Some(286.1438) }, Analyte { name: "B".into(), rt: Some(3.25), ions: vec![300.0], precursor: None }],
         samples: vec![SampleRec {
             path: r"C:\data\a b.raw".into(), raw_sha256: "ab".repeat(32), kind: "Standard".into(), conc: 0.1, rt_shift: -0.0123, show: true, embedded: true,
-            cells: vec![CellRec { analyte: 0, found: true, manual: true, start: 1.0 / 3.0, end: 2.5, include: false },
-                        CellRec { analyte: 1, found: false, manual: false, start: 0.0, end: 0.0, include: true }],
+            cells: vec![CellRec { analyte: 0, found: true, manual: true, start: 1.0 / 3.0, end: 2.5, include: false, conc: Some(2.5) },
+                        CellRec { analyte: 1, found: false, manual: false, start: 0.0, end: 0.0, include: true, conc: None }],
         }],
     };
     assert_eq!(ProjectFile::parse(&pf.to_text()).unwrap(), pf);
@@ -431,6 +434,7 @@ fn svg_export_contains_axes_series_and_escapes_text() {
             svg::SvgSeries { name: "empty".into(), rgb: (0, 0, 0), width: 1.0, points: vec![] },
         ],
         vlines: vec![svg::SvgVLine { x: 7.2, rgb: (0, 100, 0), label: "start".into() }],
+        labels: vec![svg::SvgLabel { x: 7.2, y: 100.0, text: "286.1438".into(), rgb: (0, 0, 0) }],
         bounds: [7.0, 7.4, 0.0, 100.0], x_fmt: rt2, y_fmt: pct0,
     };
     let s = svg::render(&plot);
@@ -440,5 +444,19 @@ fn svg_export_contains_axes_series_and_escapes_text() {
     assert!(s.contains(">7.20<"), "retention-time tick with two decimals");
     assert!(s.contains(">100%<") && s.contains(">0%<"), "percent axis from 0 to 100");
     assert!(s.contains("m/z 150.0000") && s.contains("clip-path"));
+    assert!(s.contains(">286.1438<"), "peak labels (m/z of the top peaks) are part of the figure");
     assert!(!s.contains("NaN"));
+}
+
+#[test]
+fn project_blob_reader_returns_the_embedded_bytes() {
+    let dir = tmp_dir("blob");
+    let raw = dir.join("a.mzML");
+    std::fs::write(&raw, b"<mzML>demo</mzML>").unwrap();
+    let pf = ProjectFile { samples: vec![sample("a.mzML")], ..Default::default() };
+    let out = dir.join("p.quant");
+    let offs = write_container(&out, &pf, &[Some(BlobSource::File(raw))]).unwrap();
+    let (o, l) = offs[0].unwrap();
+    assert_eq!(lcms_quant::project::read_blob(&out, o, l).unwrap(), b"<mzML>demo</mzML>");
+    let _ = std::fs::remove_dir_all(&dir);
 }

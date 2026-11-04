@@ -8,6 +8,9 @@ fn sup(n: i32) -> String {
     s
 }
 
+/// Compact scientific notation (3 significant digits) for axis ticks.
+pub fn sci3(x: f64) -> String { sci_prec(x, 3) }
+
 /// m/z values: four decimals, plain notation: 286.14384 -> "286.1438".
 pub fn mz4(x: f64) -> String { format!("{:.4}", x) }
 
