@@ -1,4 +1,4 @@
-# LC-MS/MS Quant
+# msQuant
 
 Desktop app (Windows, macOS) for **targeted quantification of LC-MS/MS data** from Thermo `.raw` and mzML files.
 Repository: <https://github.com/markellerhorst/msQuant>
@@ -35,8 +35,8 @@ Requirements: [Rust](https://rustup.rs) (stable); on Windows additionally the *V
 
 ```powershell
 git clone https://github.com/markellerhorst/msQuant
-cd lcms-quant
-cargo run --release          # or: cargo build --release  -> target/release/lcms-quant(.exe)
+cd msQuant
+cargo run --release          # or: cargo build --release  -> target/release/msQuant(.exe)
 ```
 
 ### Thermo reader (only for `.raw` files)
