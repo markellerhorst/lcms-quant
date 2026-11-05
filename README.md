@@ -29,6 +29,8 @@ chromatograms, integrates the peaks (boundaries adjustable by hand, values updat
 - Projects (`.quant`) that **contain the raw files** (optional), undo/redo (10 steps), zoom with Ctrl +/-/0, user name in the audit trail
 - Numbers in scientific notation (`10²`), except retention times (`7.20` min) and m/z values (`286.1438`); normalised views show 0–100 %
 
+![App Screenshot](img/20261104_app_screenshot.png)
+
 ## Build
 Requirements: [Rust](https://rustup.rs) (stable); on Windows additionally the *Visual Studio Build Tools* with the
 "Desktop development with C++" workload; on macOS the Xcode command-line tools.
