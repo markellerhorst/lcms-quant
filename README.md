@@ -23,6 +23,8 @@ chromatograms, integrates the peaks (boundaries adjustable by hand, values updat
 - **Quick XIC** for any m/z (MS1 or MS2) without defining a target; "Add as target" makes it permanent
 - Hover read-out on chromatograms (m/z, RT, scan, precursor m/z, intensity) and a linked **MS2 spectrum panel**; the cursor snaps to the nearest peak (RT + m/z)
 - Explorer-style multi-select (Ctrl / Shift), right-click to remove a file from the project (never deletes it on disk)
+- Natural zoom: drag a box around a peak to zoom to it (chromatograms and MS2 spectra), Shift/middle-drag pans, right-click → *Reset zoom*;
+  integration boundaries are moved by grabbing the start/end line itself
 - Right-click any chromatogram or MS2 spectrum → save as **PNG**, **SVG** (spectra carry the m/z of the 10 strongest peaks) or a **two-column CSV** (RT/Intensity, m/z/Intensity); file names say what is exported (TIC, BPC, XIC, MS2 scan)
 - Projects (`.quant`) that **contain the raw files** (optional), undo/redo (10 steps), zoom with Ctrl +/-/0, user name in the audit trail
 - Numbers in scientific notation (`10²`), except retention times (`7.20` min) and m/z values (`286.1438`); normalised views show 0–100 %

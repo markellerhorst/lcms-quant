@@ -10,7 +10,7 @@ use crate::{
     rawconv,
 };
 use eframe::egui::{self, Color32, Key, Modifiers, PointerButton, RichText};
-use egui_plot::{Legend, Line, Plot, PlotPoint, PlotPoints, Points, Polygon, Text, VLine};
+use egui_plot::{Legend, Line, Plot, PlotBounds, PlotPoint, PlotPoints, Points, Polygon, Text, VLine};
 use std::path::{Path, PathBuf};
 use std::sync::{
     mpsc::{channel, Receiver, Sender},
@@ -93,10 +93,62 @@ macro_rules! draw_series {
     }};
 }
 
-/// Right-click menu of a plot: save as PNG / SVG, or one trace as a two-column CSV.
+/// Zoom window: the rectangle between the drag start and the pointer, if it is large enough to be intended (>1 % of the view in both directions).
+fn zoom_box(start: [f64; 2], end: [f64; 2], xw: f64, yw: f64) -> Option<([f64; 2], [f64; 2])> {
+    let (x0, x1) = (start[0].min(end[0]), start[0].max(end[0]));
+    let (y0, y1) = (start[1].min(end[1]), start[1].max(end[1]));
+    if x1 - x0 > 0.01 * xw && y1 - y0 > 0.01 * yw { Some(([x0, y0], [x1, y1])) } else { None }
+}
+
+/// Integration boundary under the pointer: Some(true) = start line, Some(false) = end line, None = none within `max_px` pixels.
+fn nearest_boundary(px: f64, start: f64, end: f64, px_per_unit: f64, max_px: f64) -> Option<bool> {
+    let (ds, de) = ((px - start).abs() * px_per_unit, (px - end).abs() * px_per_unit);
+    if ds.min(de) > max_px { None } else { Some(ds <= de) }
+}
+
+/// Mouse navigation of a plot: drag a box with the left button to zoom to it, Shift+left-drag or middle-drag pans.
+/// `$blocked`: true while the left button is busy with something else (moving an integration boundary).
+/// Evaluates to true when the view was zoomed by a box.
+macro_rules! zoom_pan {
+    ($pu:ident, $r:ident, $zoom:ident, $blocked:expr) => {{
+        let shift = $r.ctx.input(|i| i.modifiers.shift);
+        let mut zoomed = false;
+        if $r.dragged_by(PointerButton::Middle) || ($r.dragged_by(PointerButton::Primary) && shift) {
+            let d = $pu.pointer_coordinate_drag_delta();
+            $pu.translate_bounds(-d);
+        } else if let Some(p) = $pu.pointer_coordinate() {
+            if $r.drag_started_by(PointerButton::Primary) && !$blocked { $zoom = Some([p.x, p.y]); }
+            if $r.dragged_by(PointerButton::Primary) {
+                if let Some(s0) = $zoom {
+                    let (x0, x1) = (s0[0].min(p.x), s0[0].max(p.x));
+                    let (y0, y1) = (s0[1].min(p.y), s0[1].max(p.y));
+                    $pu.polygon(Polygon::new(PlotPoints::from(vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]))
+                        .fill_color(Color32::from_rgba_unmultiplied(100, 150, 255, 45))
+                        .stroke(egui::Stroke::new(1.5_f32, Color32::from_rgb(100, 150, 255))));
+                }
+            }
+            if $r.drag_stopped() {
+                if let Some(s0) = $zoom.take() {
+                    let b = $pu.plot_bounds();
+                    let (xw, yw) = (b.max()[0] - b.min()[0], b.max()[1] - b.min()[1]);
+                    if let Some((lo, hi)) = zoom_box(s0, [p.x, p.y], xw, yw) {
+                        $pu.set_plot_bounds(PlotBounds::from_min_max(lo, hi));
+                        zoomed = true;
+                    }
+                }
+            }
+        }
+        zoomed
+    }};
+}
+
+/// Right-click menu of a plot: reset zoom, save as PNG / SVG, or one trace as a two-column CSV.
 macro_rules! export_menu {
     ($resp:expr, $what:expr, $out:ident, $names:expr) => {
         $resp.context_menu(|ui| {
+            if ui.button("Reset zoom").clicked() { $out = Some(ExportKind::Reset); ui.close_menu(); }
+            ui.weak("drag a box = zoom · Shift/middle-drag = pan");
+            ui.separator();
             if ui.button(format!("Save {} as PNG…", $what)).clicked() { $out = Some(ExportKind::Png); ui.close_menu(); }
             if ui.button(format!("Save {} as SVG…", $what)).clicked() { $out = Some(ExportKind::Svg); ui.close_menu(); }
             ui.separator();
@@ -108,7 +160,7 @@ macro_rules! export_menu {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum ExportKind { Png, Svg, Csv(usize) }
+enum ExportKind { Png, Svg, Csv(usize), Reset }
 
 /// A pending PNG capture of one plot (taken from the window screenshot after the context menu has closed).
 struct Capture { rect: egui::Rect, path: PathBuf, frames: u8, sent: bool }
@@ -322,6 +374,11 @@ pub struct App {
     saving: usize,
     capture: Option<Capture>,
     show_prefs: bool,
+    zoom_chrom: Option<[f64; 2]>,
+    zoom_spec: Option<[f64; 2]>,
+    reset_chrom: bool,
+    reset_spec: bool,
+    spec_last: Option<(usize, usize)>,
     assign_target: usize,
     assign_conc: f64,
     quick_mz: f64,
@@ -406,7 +463,7 @@ impl App {
             zoom: 1.0, title: String::new(),
             basis: Basis::Ms2, show_spectrum: true, spec_autofit: true, follow_hover: false, pinned_scan: None, hover: None,
             col_w: [0.0; 4], embed_raw: true, saving: 0, capture: None,
-            show_prefs: false, assign_target: 0, assign_conc: 1.0, quick_mz: 100.0, quick_level: 1,
+            show_prefs: false, zoom_chrom: None, zoom_spec: None, reset_chrom: false, reset_spec: false, spec_last: None, assign_target: 0, assign_conc: 1.0, quick_mz: 100.0, quick_level: 1,
         };
         app.load_settings();
         app
@@ -1163,6 +1220,9 @@ impl App {
         let mut csv_req: Option<(String, String)> = None;
         let tmz = self.trace_mz(a);
         let capturing = self.capture.is_some();
+        let reset_now = std::mem::take(&mut self.reset_chrom);
+        let mut zoom_c = self.zoom_chrom;
+        let mut reset_req = false;
         {
             let sm = &self.samples[s];
             let c = &sm.cells[a];
@@ -1175,9 +1235,11 @@ impl App {
                          desc: format!("{} · {}", self.analytes[a].name, d), scale: if norm && mx > 0.0 { 100.0 / mx } else { 1.0 } }
             }).collect();
             let scan_of = |f: usize, l: u8, j: usize| -> String { scan_info(&self.samples[f].data, l, j) };
-            let pr = rtplot!(Plot::new("xic").height(300.0).allow_drag(false).allow_boxed_zoom(false)
-                .legend(Legend::default()).x_axis_label("Retention time (min)  |  drag a green/red boundary line, click = pin the scan")
-                .y_axis_label(if norm { "Intensity (% of maximum)" } else { "Intensity" }), norm)
+            let mut plot = rtplot!(Plot::new("xic").height(300.0).allow_drag(false).allow_boxed_zoom(false)
+                .legend(Legend::default()).x_axis_label("Retention time (min)  |  drag a box = zoom · grab a boundary line to move it · click = pin the scan")
+                .y_axis_label(if norm { "Intensity (% of maximum)" } else { "Intensity" }), norm);
+            if reset_now { plot = plot.reset(); }
+            let pr = plot
                 .show(ui, |pu| {
                     draw_series!(pu, &series, hover, scan_of, capturing);
                     if c.found && !norm {
@@ -1189,10 +1251,13 @@ impl App {
                         pu.vline(VLine::new(c.end).color(Color32::DARK_RED));
                     }
                     let r = pu.response().clone();
+                    let bnd = pu.plot_bounds();
+                    let pxw = r.rect.width() as f64 / (bnd.max()[0] - bnd.min()[0]).max(1e-12);
                     if let Some(p) = pu.pointer_coordinate() {
-                        if r.drag_started_by(PointerButton::Primary) && c.found {
-                            grab = Some((p.x - c.start).abs() <= (p.x - c.end).abs());
-                        }
+                        // a boundary line is only moved when it is grabbed (within 8 px); anywhere else a drag draws the zoom window
+                        let near = if c.found { nearest_boundary(p.x, c.start, c.end, pxw, 8.0) } else { None };
+                        if near.is_some() && r.hovered() { r.ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal); }
+                        if r.drag_started_by(PointerButton::Primary) { grab = near; }
                         if r.dragged_by(PointerButton::Primary) {
                             if let Some(g) = grab {
                                 let (mut st, mut en) = (c.start, c.end);
@@ -1201,6 +1266,7 @@ impl App {
                             }
                         }
                     }
+                    let _ = zoom_pan!(pu, r, zoom_c, grab.is_some());
                     if r.drag_stopped() { stopped = true; }
                 });
             clicked = pr.response.clicked() && !capturing;
@@ -1211,6 +1277,7 @@ impl App {
             if let Some(k) = ex {
                 let (file, target) = (safe_name(&sm.data.name), safe_name(&self.analytes[a].name));
                 match k {
+                    ExportKind::Reset => { reset_req = true; }
                     ExportKind::Csv(i) => {
                         if let Some(sr) = series.get(i) {
                             csv_req = Some((format!("XIC_{}_mz{}_{}", target, mz4(tmz[i]), file),
@@ -1238,6 +1305,8 @@ impl App {
             self.hover = Some((h.file, h.rt));
             if clicked { self.pin_scan(h.file, h.rt); }
         }
+        self.zoom_chrom = zoom_c;
+        if reset_req { self.reset_chrom = true; ui.ctx().request_repaint(); }
         if let Some((k, plot, rect, stem)) = export_req { self.do_export(k, plot, rect, &stem); }
         if let Some((stem, text)) = csv_req { self.save_csv(&stem, &text); }
         if let Some((st, en)) = edit { self.apply_edit(s, a, st, en); }
@@ -1366,13 +1435,21 @@ impl App {
         let mut export_req: Option<(ExportKind, SvgPlot, egui::Rect, String)> = None;
         let mut csv_req: Option<(String, String)> = None;
         let capturing = self.capture.is_some();
+        let reset_now = std::mem::take(&mut self.reset_chrom);
+        let mut zoom_c = self.zoom_chrom;
+        let mut reset_req = false;
         {
             let scan_of = |f: usize, l: u8, j: usize| -> String { scan_info(&self.samples[f].data, l, j) };
-            let pr = rtplot!(Plot::new(id).height(380.0).legend(Legend::default()).x_axis_label("Retention time (min)  |  click = pin the nearest MS2 scan")
-                .y_axis_label(if norm { "Intensity (% of maximum)" } else { "Intensity" }), norm)
+            let mut plot = rtplot!(Plot::new(id).height(380.0).allow_drag(false).allow_boxed_zoom(false).legend(Legend::default())
+                .x_axis_label("Retention time (min)  |  drag a box = zoom · click = pin the nearest MS2 scan")
+                .y_axis_label(if norm { "Intensity (% of maximum)" } else { "Intensity" }), norm);
+            if reset_now { plot = plot.reset(); }
+            let pr = plot
                 .show(ui, |pu| {
                     draw_series!(pu, &series, hover, scan_of, capturing);
                     if let Some(h) = rt_hint { pu.vline(VLine::new(h).color(Color32::GRAY).name("expected RT")); }
+                    let r = pu.response().clone();
+                    let _ = zoom_pan!(pu, r, zoom_c, false);
                 });
             clicked = pr.response.clicked() && !capturing;
             let rect = pr.response.rect;
@@ -1397,6 +1474,7 @@ impl App {
                     }
                 };
                 match k {
+                    ExportKind::Reset => { reset_req = true; }
                     ExportKind::Csv(i) => {
                         if let Some(sr) = series.get(i) {
                             let stem = if self.view == View::Xic && self.scope == Scope::AllTargets { format!("XIC_{}_{}", safe_name(&sr.name), safe_name(&sr.fname)) }
@@ -1421,6 +1499,8 @@ impl App {
             if clicked { self.pin_scan(h.file, h.rt); }
         }
         if let Some((k, plot, rect, stem)) = export_req { self.do_export(k, plot, rect, &stem); }
+        self.zoom_chrom = zoom_c;
+        if reset_req { self.reset_chrom = true; ui.ctx().request_repaint(); }
         if let Some((stem, text)) = csv_req { self.save_csv(&stem, &text); }
     }
 
@@ -1916,9 +1996,9 @@ impl App {
         ui.horizontal(|ui| {
             ui.strong("MS2 spectrum");
             ui.checkbox(&mut self.follow_hover, "follow chromatogram hover");
-            ui.checkbox(&mut self.spec_autofit, "auto-fit view");
+            ui.checkbox(&mut self.spec_autofit, "auto-fit when the scan changes");
             if self.pinned_scan.is_some() && ui.button("Unpin scan").clicked() { self.pinned_scan = None; }
-            ui.weak("click the chromatogram to pin the nearest MS2 scan · right-click a plot to save it");
+            ui.weak("drag a box = zoom · Shift/middle-drag = pan · right-click = reset zoom / save · click the chromatogram to pin a scan");
         });
         let (f, i, why) = match self.spectrum_pick() {
             Some(x) => x,
@@ -1926,6 +2006,12 @@ impl App {
         };
         let mut export_req: Option<(ExportKind, SvgPlot, egui::Rect, String)> = None;
         let mut csv_req: Option<(String, String)> = None;
+        // the view is re-fitted when the scan changes (if "auto-fit" is on) or when "Reset zoom" was chosen; otherwise a zoom window stays
+        let reset_now = std::mem::take(&mut self.reset_spec) || (self.spec_autofit && self.spec_last != Some((f, i)));
+        self.spec_last = Some((f, i));
+        let mut zoom_s = self.zoom_spec;
+        let mut zoomed_spec = false;
+        let mut reset_req = false;
         {
             let sm = &self.samples[f];
             let sp = &sm.data.spectra[i];
@@ -1958,9 +2044,9 @@ impl App {
                     }
                 });
             }
-            let mut plot = mzplot!(Plot::new("spec").height(ui.available_height()).x_axis_label("m/z")
+            let mut plot = mzplot!(Plot::new("spec").height(ui.available_height()).allow_drag(false).allow_boxed_zoom(false).x_axis_label("m/z")
                 .y_axis_label(if norm { "Intensity (% of maximum)" } else { "Intensity" }), norm);
-            if self.spec_autofit { plot = plot.reset(); }
+            if reset_now { plot = plot.reset(); }
             let pr = plot.show(ui, |pu| {
                 pu.line(Line::new(PlotPoints::from(all.clone())).color(Color32::GRAY));
                 for (k, ion, v) in &hl {
@@ -1987,6 +2073,8 @@ impl App {
                             .anchor(if right { egui::Align2::RIGHT_BOTTOM } else { egui::Align2::LEFT_BOTTOM }));
                     }
                 }
+                let r = pu.response().clone();
+                if zoom_pan!(pu, r, zoom_s, false) { zoomed_spec = true; }
             });
             let rect = pr.response.rect;
             let (x0, x1, y0, y1) = { let b = pr.transform.bounds(); (b.min()[0], b.max()[0], b.min()[1], b.max()[1]) };
@@ -1996,6 +2084,7 @@ impl App {
             if let Some(k) = ex {
                 let stem = format!("MS2_scan_{}_{}", sp.scan, safe_name(&sm.data.name));
                 match k {
+                    ExportKind::Reset => { reset_req = true; }
                     ExportKind::Csv(_) => {
                         csv_req = Some((stem, csv_two("m/z", "Intensity", sp.mz.iter().cloned().zip(sp.inten.iter().map(|&v| v as f64)))));
                     }
@@ -2018,6 +2107,9 @@ impl App {
             }
         }
         if let Some((k, plot, rect, stem)) = export_req { self.do_export(k, plot, rect, &stem); }
+        self.zoom_spec = zoom_s;
+        if zoomed_spec { self.spec_autofit = false; }
+        if reset_req { self.reset_spec = true; ui.ctx().request_repaint(); }
         if let Some((stem, text)) = csv_req { self.save_csv(&stem, &text); }
     }
 
@@ -2848,5 +2940,24 @@ mod tests {
         assert!(a.samples[1..=3].iter().all(|s| s.kind == Kind::Unknown));
         a.undo();
         assert!(a.samples[1..=3].iter().all(|s| s.kind == Kind::Standard), "undo restores the whole group at once");
+    }
+
+    #[test]
+    fn zoom_window_needs_a_real_drag_and_is_order_independent() {
+        let (xw, yw) = (10.0, 1000.0);
+        assert_eq!(zoom_box([2.0, 100.0], [4.0, 600.0], xw, yw), Some(([2.0, 100.0], [4.0, 600.0])));
+        assert_eq!(zoom_box([4.0, 600.0], [2.0, 100.0], xw, yw), Some(([2.0, 100.0], [4.0, 600.0])), "dragging up-left works too");
+        assert_eq!(zoom_box([2.0, 100.0], [2.05, 600.0], xw, yw), None, "a click or a tiny jitter does not zoom");
+        assert_eq!(zoom_box([2.0, 100.0], [4.0, 105.0], xw, yw), None);
+    }
+
+    #[test]
+    fn boundary_lines_are_only_grabbed_when_the_pointer_is_on_them() {
+        // 100 px per minute: 8 px = 0.08 min
+        assert_eq!(nearest_boundary(4.95, 5.0, 5.4, 100.0, 8.0), Some(true));
+        assert_eq!(nearest_boundary(5.37, 5.0, 5.4, 100.0, 8.0), Some(false));
+        assert_eq!(nearest_boundary(5.2, 5.0, 5.4, 100.0, 8.0), None, "in the middle of the peak a drag draws a zoom window");
+        assert_eq!(nearest_boundary(5.2, 5.0, 5.4, 1000.0, 8.0), None);
+        assert_eq!(nearest_boundary(5.004, 5.0, 5.4, 1000.0, 8.0), Some(true));
     }
 }
