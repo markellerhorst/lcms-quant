@@ -1,7 +1,7 @@
 # LC-MS/MS Quant
 
 Desktop app (Windows, macOS) for **targeted quantification of LC-MS/MS data** from Thermo `.raw` and mzML files.
-Repository: <https://github.com/markellerhorst/lcms-quant>
+Repository: <https://github.com/markellerhorst/msQuant>
 
 You provide a target table (name, retention time or `n/a`, diagnostic MS2 product ions, optionally the MS1 precursor m/z); the program extracts the
 chromatograms, integrates the peaks (boundaries adjustable by hand, values update live) and reports either **integrated areas
@@ -34,7 +34,7 @@ Requirements: [Rust](https://rustup.rs) (stable); on Windows additionally the *V
 "Desktop development with C++" workload; on macOS the Xcode command-line tools.
 
 ```powershell
-git clone https://github.com/markellerhorst/lcms-quant
+git clone https://github.com/markellerhorst/msQuant
 cd lcms-quant
 cargo run --release          # or: cargo build --release  -> target/release/lcms-quant(.exe)
 ```
