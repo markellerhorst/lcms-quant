@@ -1,6 +1,13 @@
 //! Vector export of a plot (chromatogram or MS2 spectrum) as a stand-alone SVG file.
 
-pub struct SvgSeries { pub name: String, pub rgb: (u8, u8, u8), pub width: f32, pub points: Vec<[f64; 2]> }
+pub struct SvgSeries {
+    pub name: String,
+    pub rgb: (u8, u8, u8),
+    pub width: f32,
+    pub points: Vec<[f64; 2]>,
+    /// draw the points as filled circles instead of a connected line (calibration points)
+    pub marker: bool,
+}
 /// Text label placed above a data point (e.g. the m/z of the most intense peaks of a spectrum).
 pub struct SvgLabel { pub x: f64, pub y: f64, pub text: String, pub rgb: (u8, u8, u8) }
 pub struct SvgVLine { pub x: f64, pub rgb: (u8, u8, u8), pub label: String }
@@ -12,6 +19,8 @@ pub struct SvgPlot {
     pub series: Vec<SvgSeries>,
     pub vlines: Vec<SvgVLine>,
     pub labels: Vec<SvgLabel>,
+    /// text lines in a box in the top-left corner of the plot (e.g. regression formula and R²)
+    pub notes: Vec<String>,
     /// visible range: [x_min, x_max, y_min, y_max]
     pub bounds: [f64; 4],
     pub x_fmt: fn(f64) -> String,
@@ -69,6 +78,12 @@ pub fn render(p: &SvgPlot) -> String {
         s += &format!("<line x1=\"{x:.2}\" y1=\"{t}\" x2=\"{x:.2}\" y2=\"{:.2}\" stroke=\"{}\" stroke-width=\"1.2\" stroke-dasharray=\"5,3\"/>\n", t + ph, col(v.rgb), x = fx(v.x));
     }
     for sr in &p.series {
+        if sr.marker {
+            for q in sr.points.iter().filter(|q| q[0].is_finite() && q[1].is_finite()) {
+                s += &format!("<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"4.5\" fill=\"{}\" fill-opacity=\"0.85\" stroke=\"#222\" stroke-width=\"0.8\"/>\n", fx(q[0]), fy(q[1]), col(sr.rgb));
+            }
+            continue;
+        }
         let mut d = String::new();
         for (i, q) in sr.points.iter().filter(|q| q[0].is_finite() && q[1].is_finite()).enumerate() {
             d += &format!("{}{:.2},{:.2} ", if i == 0 { "M" } else { "L" }, fx(q[0]), fy(q[1]));
@@ -77,6 +92,14 @@ pub fn render(p: &SvgPlot) -> String {
         s += &format!("<path d=\"{}\" stroke=\"{}\" stroke-width=\"{}\" stroke-linejoin=\"round\"/>\n", d.trim_end(), col(sr.rgb), sr.width);
     }
     s += "</g>\n";
+    if !p.notes.is_empty() {
+        let w = p.notes.iter().map(|n| n.chars().count()).max().unwrap_or(0) as f64 * 8.4 + 20.0;
+        let h = p.notes.len() as f64 * 20.0 + 10.0;
+        s += &format!("<rect x=\"{:.2}\" y=\"{:.2}\" width=\"{:.2}\" height=\"{:.2}\" fill=\"white\" fill-opacity=\"0.9\" stroke=\"#999\"/>\n", l + 8.0, t + 8.0, w, h);
+        for (i, n) in p.notes.iter().enumerate() {
+            s += &format!("<text x=\"{:.2}\" y=\"{:.2}\" font-size=\"14\">{}</text>\n", l + 18.0, t + 28.0 + i as f64 * 20.0, esc(n));
+        }
+    }
     for lb in &p.labels {
         s += &format!("<text x=\"{:.2}\" y=\"{:.2}\" text-anchor=\"middle\" font-size=\"11\" fill=\"{}\">{}</text>\n", fx(lb.x), fy(lb.y) - 5.0, col(lb.rgb), esc(&lb.text));
     }
@@ -85,7 +108,11 @@ pub fn render(p: &SvgPlot) -> String {
     let mut ly = t + 12.0;
     let lx = l + pw + 20.0;
     for sr in p.series.iter().take(30) {
-        s += &format!("<line x1=\"{lx}\" y1=\"{ly}\" x2=\"{}\" y2=\"{ly}\" stroke=\"{}\" stroke-width=\"3\"/>\n", lx + 24.0, col(sr.rgb));
+        if sr.marker {
+            s += &format!("<circle cx=\"{}\" cy=\"{ly}\" r=\"4.5\" fill=\"{}\" stroke=\"#222\" stroke-width=\"0.8\"/>\n", lx + 12.0, col(sr.rgb));
+        } else {
+            s += &format!("<line x1=\"{lx}\" y1=\"{ly}\" x2=\"{}\" y2=\"{ly}\" stroke=\"{}\" stroke-width=\"3\"/>\n", lx + 24.0, col(sr.rgb));
+        }
         s += &format!("<text x=\"{}\" y=\"{}\">{}</text>\n", lx + 32.0, ly + 4.0, esc(&sr.name));
         ly += 20.0;
     }

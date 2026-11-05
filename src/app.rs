@@ -1,6 +1,6 @@
 use crate::{
     audit::{self, iso_now, Audit},
-    fmt::{mz4, parse_sci, pct0, rt2, sci, sci3},
+    fmt::{mz4, parse_sci, pct0, rt2, sci, sci3, sci_prec},
     history::History,
     mzml::{self, MzData, Spectrum},
     png,
@@ -77,7 +77,7 @@ macro_rules! draw_series {
         if !$cap {
             if let Some(p) = $pu.pointer_coordinate() {
                 let b = $pu.plot_bounds();
-                $hover = nearest_hover($series, p.x, p.y, b.max()[0] - b.min()[0]);
+                if $pu.response().hovered() && in_view(&p, &b) { $hover = nearest_hover($series, p.x, p.y, b.max()[0] - b.min()[0]); }
             }
         }
         if let Some(h) = &$hover {
@@ -93,6 +93,10 @@ macro_rules! draw_series {
     }};
 }
 
+fn export_req_cal(slot: &mut Option<(ExportKind, SvgPlot, egui::Rect, String)>, k: ExportKind, plot: SvgPlot, rect: egui::Rect, stem: String) {
+    *slot = Some((k, plot, rect, stem));
+}
+
 /// Zoom window: the rectangle between the drag start and the pointer, if it is large enough to be intended (>1 % of the view in both directions).
 fn zoom_box(start: [f64; 2], end: [f64; 2], xw: f64, yw: f64) -> Option<([f64; 2], [f64; 2])> {
     let (x0, x1) = (start[0].min(end[0]), start[0].max(end[0]));
@@ -106,22 +110,50 @@ fn nearest_boundary(px: f64, start: f64, end: f64, px_per_unit: f64, max_px: f64
     if ds.min(de) > max_px { None } else { Some(ds <= de) }
 }
 
-/// Mouse navigation of a plot: drag a box with the left button to zoom to it, Shift+left-drag or middle-drag pans.
-/// `$blocked`: true while the left button is busy with something else (moving an integration boundary).
+/// True if the point lies inside the visible data area of a plot (not on the axes or outside the plot).
+fn in_view(p: &PlotPoint, b: &PlotBounds) -> bool {
+    p.x >= b.min()[0] && p.x <= b.max()[0] && p.y >= b.min()[1] && p.y <= b.max()[1]
+}
+
+/// Scales the interval [lo, hi] by `factor` around `pivot` (factor < 1 zooms in); the pivot keeps its relative position.
+fn scale_range(lo: f64, hi: f64, pivot: f64, factor: f64) -> (f64, f64) {
+    (pivot - (pivot - lo) * factor, pivot + (hi - pivot) * factor)
+}
+
+/// Mouse navigation of a plot: drag a box with the left button to zoom to it, Shift+left-drag or middle-drag pans,
+/// Alt+wheel scales the y axis and Shift+Alt+wheel the x axis (about the cursor). Everything only reacts while the pointer is
+/// inside the data area of the plot. `$blocked`: true while the left button is busy with something else (moving a boundary).
 /// Evaluates to true when the view was zoomed by a box.
 macro_rules! zoom_pan {
     ($pu:ident, $r:ident, $zoom:ident, $blocked:expr) => {{
-        let shift = $r.ctx.input(|i| i.modifiers.shift);
+        let (alt, shift) = $r.ctx.input(|i| (i.modifiers.alt, i.modifiers.shift));
         let mut zoomed = false;
-        if $r.dragged_by(PointerButton::Middle) || ($r.dragged_by(PointerButton::Primary) && shift) {
+        let inside = $r.hovered() && $pu.pointer_coordinate().map(|p| in_view(&p, &$pu.plot_bounds())).unwrap_or(false);
+        if alt && inside {
+            let raw = $r.ctx.input(|i| i.raw_scroll_delta);
+            let d = (if raw.y != 0.0 { raw.y } else { raw.x }) as f64;
+            if d != 0.0 {
+                if let Some(p) = $pu.pointer_coordinate() {
+                    let b = $pu.plot_bounds();
+                    let f = (-d * 0.003).exp();
+                    let (mut x0, mut x1, mut y0, mut y1) = (b.min()[0], b.max()[0], b.min()[1], b.max()[1]);
+                    if shift { let (n0, n1) = scale_range(x0, x1, p.x, f); x0 = n0; x1 = n1; }
+                    else { let (n0, n1) = scale_range(y0, y1, p.y, f); y0 = n0; y1 = n1; }
+                    $pu.set_plot_bounds(PlotBounds::from_min_max([x0, y0], [x1, y1]));
+                }
+            }
+        }
+        if $r.dragged_by(PointerButton::Middle) || ($r.dragged_by(PointerButton::Primary) && shift && !alt) {
             let d = $pu.pointer_coordinate_drag_delta();
             $pu.translate_bounds(-d);
         } else if let Some(p) = $pu.pointer_coordinate() {
-            if $r.drag_started_by(PointerButton::Primary) && !$blocked { $zoom = Some([p.x, p.y]); }
+            let b0 = $pu.plot_bounds();
+            let cp = [p.x.max(b0.min()[0]).min(b0.max()[0]), p.y.max(b0.min()[1]).min(b0.max()[1])];
+            if $r.drag_started_by(PointerButton::Primary) && !$blocked && in_view(&p, &b0) { $zoom = Some([p.x, p.y]); }
             if $r.dragged_by(PointerButton::Primary) {
                 if let Some(s0) = $zoom {
-                    let (x0, x1) = (s0[0].min(p.x), s0[0].max(p.x));
-                    let (y0, y1) = (s0[1].min(p.y), s0[1].max(p.y));
+                    let (x0, x1) = (s0[0].min(cp[0]), s0[0].max(cp[0]));
+                    let (y0, y1) = (s0[1].min(cp[1]), s0[1].max(cp[1]));
                     $pu.polygon(Polygon::new(PlotPoints::from(vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]))
                         .fill_color(Color32::from_rgba_unmultiplied(100, 150, 255, 45))
                         .stroke(egui::Stroke::new(1.5_f32, Color32::from_rgb(100, 150, 255))));
@@ -129,9 +161,8 @@ macro_rules! zoom_pan {
             }
             if $r.drag_stopped() {
                 if let Some(s0) = $zoom.take() {
-                    let b = $pu.plot_bounds();
-                    let (xw, yw) = (b.max()[0] - b.min()[0], b.max()[1] - b.min()[1]);
-                    if let Some((lo, hi)) = zoom_box(s0, [p.x, p.y], xw, yw) {
+                    let (xw, yw) = (b0.max()[0] - b0.min()[0], b0.max()[1] - b0.min()[1]);
+                    if let Some((lo, hi)) = zoom_box(s0, cp, xw, yw) {
                         $pu.set_plot_bounds(PlotBounds::from_min_max(lo, hi));
                         zoomed = true;
                     }
@@ -148,6 +179,7 @@ macro_rules! export_menu {
         $resp.context_menu(|ui| {
             if ui.button("Reset zoom").clicked() { $out = Some(ExportKind::Reset); ui.close_menu(); }
             ui.weak("drag a box = zoom · Shift/middle-drag = pan");
+            ui.weak("Alt+wheel = scale y · Shift+Alt+wheel = scale x");
             ui.separator();
             if ui.button(format!("Save {} as PNG…", $what)).clicked() { $out = Some(ExportKind::Png); ui.close_menu(); }
             if ui.button(format!("Save {} as SVG…", $what)).clicked() { $out = Some(ExportKind::Svg); ui.close_menu(); }
@@ -174,7 +206,7 @@ fn safe_name(s: &str) -> String {
 fn svg_series(series: &[Series]) -> Vec<SvgSeries> {
     series.iter().map(|s| SvgSeries {
         name: s.name.clone(), rgb: color_rgb(pal(s.ci)), width: if s.cur { 2.5 } else { 1.5 },
-        points: s.data.iter().map(|p| [p[0], p[1] * s.scale]).collect(),
+        points: s.data.iter().map(|p| [p[0], p[1] * s.scale]).collect(), marker: false,
     }).collect()
 }
 
@@ -374,6 +406,7 @@ pub struct App {
     saving: usize,
     capture: Option<Capture>,
     show_prefs: bool,
+    reset_cal: bool,
     zoom_chrom: Option<[f64; 2]>,
     zoom_spec: Option<[f64; 2]>,
     reset_chrom: bool,
@@ -463,7 +496,7 @@ impl App {
             zoom: 1.0, title: String::new(),
             basis: Basis::Ms2, show_spectrum: true, spec_autofit: true, follow_hover: false, pinned_scan: None, hover: None,
             col_w: [0.0; 4], embed_raw: true, saving: 0, capture: None,
-            show_prefs: false, zoom_chrom: None, zoom_spec: None, reset_chrom: false, reset_spec: false, spec_last: None, assign_target: 0, assign_conc: 1.0, quick_mz: 100.0, quick_level: 1,
+            show_prefs: false, reset_cal: false, zoom_chrom: None, zoom_spec: None, reset_chrom: false, reset_spec: false, spec_last: None, assign_target: 0, assign_conc: 1.0, quick_mz: 100.0, quick_level: 1,
         };
         app.load_settings();
         app
@@ -1221,6 +1254,7 @@ impl App {
         let tmz = self.trace_mz(a);
         let capturing = self.capture.is_some();
         let reset_now = std::mem::take(&mut self.reset_chrom);
+        let alt = ui.input(|i| i.modifiers.alt);
         let mut zoom_c = self.zoom_chrom;
         let mut reset_req = false;
         {
@@ -1235,7 +1269,7 @@ impl App {
                          desc: format!("{} · {}", self.analytes[a].name, d), scale: if norm && mx > 0.0 { 100.0 / mx } else { 1.0 } }
             }).collect();
             let scan_of = |f: usize, l: u8, j: usize| -> String { scan_info(&self.samples[f].data, l, j) };
-            let mut plot = rtplot!(Plot::new("xic").height(300.0).allow_drag(false).allow_boxed_zoom(false)
+            let mut plot = rtplot!(Plot::new("xic").height(300.0).allow_drag(false).allow_boxed_zoom(false).allow_scroll(!alt)
                 .legend(Legend::default()).x_axis_label("Retention time (min)  |  drag a box = zoom · grab a boundary line to move it · click = pin the scan")
                 .y_axis_label(if norm { "Intensity (% of maximum)" } else { "Intensity" }), norm);
             if reset_now { plot = plot.reset(); }
@@ -1255,7 +1289,7 @@ impl App {
                     let pxw = r.rect.width() as f64 / (bnd.max()[0] - bnd.min()[0]).max(1e-12);
                     if let Some(p) = pu.pointer_coordinate() {
                         // a boundary line is only moved when it is grabbed (within 8 px); anywhere else a drag draws the zoom window
-                        let near = if c.found { nearest_boundary(p.x, c.start, c.end, pxw, 8.0) } else { None };
+                        let near = if c.found && in_view(&p, &bnd) { nearest_boundary(p.x, c.start, c.end, pxw, 8.0) } else { None };
                         if near.is_some() && r.hovered() { r.ctx.set_cursor_icon(egui::CursorIcon::ResizeHorizontal); }
                         if r.drag_started_by(PointerButton::Primary) { grab = near; }
                         if r.dragged_by(PointerButton::Primary) {
@@ -1295,7 +1329,7 @@ impl App {
                             title: format!("{} · {}", sm.data.name, self.analytes[a].name),
                             x_label: "Retention time (min)".into(),
                             y_label: if norm { "Intensity (% of maximum)".into() } else { "Intensity".into() },
-                            series: svg_series(&series), vlines: vl, labels: vec![], bounds: [x0, x1, y0, y1], x_fmt: rt2, y_fmt: yf,
+                            series: svg_series(&series), vlines: vl, labels: vec![], notes: vec![], bounds: [x0, x1, y0, y1], x_fmt: rt2, y_fmt: yf,
                         }, rect, format!("XIC_{}_{}", target, file)));
                     }
                 }
@@ -1436,11 +1470,12 @@ impl App {
         let mut csv_req: Option<(String, String)> = None;
         let capturing = self.capture.is_some();
         let reset_now = std::mem::take(&mut self.reset_chrom);
+        let alt = ui.input(|i| i.modifiers.alt);
         let mut zoom_c = self.zoom_chrom;
         let mut reset_req = false;
         {
             let scan_of = |f: usize, l: u8, j: usize| -> String { scan_info(&self.samples[f].data, l, j) };
-            let mut plot = rtplot!(Plot::new(id).height(380.0).allow_drag(false).allow_boxed_zoom(false).legend(Legend::default())
+            let mut plot = rtplot!(Plot::new(id).height(380.0).allow_drag(false).allow_boxed_zoom(false).allow_scroll(!alt).legend(Legend::default())
                 .x_axis_label("Retention time (min)  |  drag a box = zoom · click = pin the nearest MS2 scan")
                 .y_axis_label(if norm { "Intensity (% of maximum)" } else { "Intensity" }), norm);
             if reset_now { plot = plot.reset(); }
@@ -1488,7 +1523,7 @@ impl App {
                         export_req = Some((k, SvgPlot {
                             title, x_label: "Retention time (min)".into(),
                             y_label: if norm { "Intensity (% of maximum)".into() } else { "Intensity".into() },
-                            series: svg_series(&series), vlines: vl, labels: vec![], bounds: [x0, x1, y0, y1], x_fmt: rt2, y_fmt: yf,
+                            series: svg_series(&series), vlines: vl, labels: vec![], notes: vec![], bounds: [x0, x1, y0, y1], x_fmt: rt2, y_fmt: yf,
                         }, rect, stem_all));
                     }
                 }
@@ -1568,6 +1603,9 @@ impl App {
             if ui.button("Use all replicates").clicked() { use_all = true; }
             ui.weak(format!("{} standard file(s) assigned to this target; untick a replicate to exclude it from the curve", std_idx.len()));
         });
+        let reset_cal_now = std::mem::take(&mut self.reset_cal);
+        let mut cal_req: Option<(ExportKind, SvgPlot, egui::Rect, String)> = None;
+        let mut cal_reset = false;
         ui.columns(2, |cols| {
             cols[0].push_id("calt", |ui| {
                 egui::ScrollArea::vertical().id_salt("calscroll").max_height(240.0).show(ui, |ui| {
@@ -1616,13 +1654,55 @@ impl App {
                 let p = [c.conc, c.areas[0]];
                 if c.include { inc_pts.push(p) } else { exc_pts.push(p) }
             }
-            sciplot!(Plot::new("cal").height(220.0).x_axis_label(format!("Concentration ({})", self.units)).y_axis_label("Area"))
-                .show(&mut cols[1], |pu| {
-                    pu.points(Points::new(inc_pts).radius(4.0_f32).name("used"));
-                    pu.points(Points::new(exc_pts).radius(4.0_f32).color(Color32::GRAY).name("excluded"));
-                    if let Some(f) = fit { pu.line(Line::new(PlotPoints::from(vec![[0.0, f.b], [f.hi * 1.05, f.m * f.hi * 1.05 + f.b]])).name("fit")); }
-                });
+            let units = self.units.clone();
+            let line_pts: Option<Vec<[f64; 2]>> = fit.map(|f| vec![[0.0, f.b], [f.hi * 1.05, f.m * f.hi * 1.05 + f.b]]);
+            // regression formula and R² are written into the plot itself (and therefore into PNG / SVG exports)
+            let notes: Vec<String> = match fit {
+                Some(f) => vec![
+                    format!("area = {}·conc + {}", sci_prec(f.m, 4), sci_prec(f.b, 4)),
+                    format!("R² = {}   n = {}", sci_prec(f.r2, 5), sci(f.n as f64)),
+                    format!("weighting {}", WEIGHTS[self.weighting as usize]),
+                ],
+                None => vec![],
+            };
+            let (inc_c, exc_c) = (inc_pts.clone(), exc_pts.clone());
+            let mut plot = sciplot!(Plot::new("cal").height(220.0).x_axis_label(format!("Concentration ({})", units)).y_axis_label("Area"));
+            if reset_cal_now { plot = plot.reset(); }
+            let pr = plot.show(&mut cols[1], |pu| {
+                pu.points(Points::new(inc_pts).radius(4.0_f32).name("used"));
+                pu.points(Points::new(exc_pts).radius(4.0_f32).color(Color32::GRAY).name("excluded"));
+                if let Some(lp) = &line_pts { pu.line(Line::new(PlotPoints::from(lp.clone())).name("fit")); }
+                if !notes.is_empty() {
+                    let b = pu.plot_bounds();
+                    pu.text(Text::new(PlotPoint::new(b.min()[0], b.max()[1]),
+                        RichText::new(notes.join("\n")).color(Color32::WHITE).background_color(Color32::from_black_alpha(190)))
+                        .anchor(egui::Align2::LEFT_TOP));
+                }
+            });
+            let rect = pr.response.rect;
+            let (x0, x1, y0, y1) = { let b = pr.transform.bounds(); (b.min()[0], b.max()[0], b.min()[1], b.max()[1]) };
+            let names: Vec<String> = vec![];
+            let mut ex: Option<ExportKind> = None;
+            export_menu!(pr.response, "calibration curve", ex, &names);
+            if let Some(k) = ex {
+                match k {
+                    ExportKind::Reset => { cal_reset = true; }
+                    ExportKind::Csv(_) => {}
+                    _ => {
+                        let mut ss = vec![SvgSeries { name: "used".into(), rgb: (31, 119, 180), width: 1.0, points: inc_c, marker: true }];
+                        if !exc_c.is_empty() { ss.push(SvgSeries { name: "excluded".into(), rgb: (150, 150, 150), width: 1.0, points: exc_c, marker: true }); }
+                        if let Some(lp) = line_pts { ss.push(SvgSeries { name: "fit".into(), rgb: (214, 39, 40), width: 2.0, points: lp, marker: false }); }
+                        export_req_cal(&mut cal_req, k, SvgPlot {
+                            title: format!("Calibration curve · {}", self.analytes[a].name),
+                            x_label: format!("Concentration ({})", units), y_label: "Area (intensity·s)".into(),
+                            series: ss, vlines: vec![], labels: vec![], notes, bounds: [x0, x1, y0, y1], x_fmt: sci3, y_fmt: sci3,
+                        }, rect, format!("Calibration_curve_{}", safe_name(&self.analytes[a].name)));
+                    }
+                }
+            }
         });
+        if cal_reset { self.reset_cal = true; ui.ctx().request_repaint(); }
+        if let Some((k, plot, rect, stem)) = cal_req { self.do_export(k, plot, rect, &stem); }
         if use_all {
             self.push_undo("use all replicates");
             for &si in &std_idx { self.samples[si].cells[a].include = true; }
@@ -1998,7 +2078,7 @@ impl App {
             ui.checkbox(&mut self.follow_hover, "follow chromatogram hover");
             ui.checkbox(&mut self.spec_autofit, "auto-fit when the scan changes");
             if self.pinned_scan.is_some() && ui.button("Unpin scan").clicked() { self.pinned_scan = None; }
-            ui.weak("drag a box = zoom · Shift/middle-drag = pan · right-click = reset zoom / save · click the chromatogram to pin a scan");
+            ui.weak("drag a box = zoom · Shift/middle-drag = pan · Alt+wheel = scale y · Shift+Alt+wheel = scale x · right-click = reset zoom / save");
         });
         let (f, i, why) = match self.spectrum_pick() {
             Some(x) => x,
@@ -2008,6 +2088,7 @@ impl App {
         let mut csv_req: Option<(String, String)> = None;
         // the view is re-fitted when the scan changes (if "auto-fit" is on) or when "Reset zoom" was chosen; otherwise a zoom window stays
         let reset_now = std::mem::take(&mut self.reset_spec) || (self.spec_autofit && self.spec_last != Some((f, i)));
+        let alt = ui.input(|i| i.modifiers.alt);
         self.spec_last = Some((f, i));
         let mut zoom_s = self.zoom_spec;
         let mut zoomed_spec = false;
@@ -2044,7 +2125,7 @@ impl App {
                     }
                 });
             }
-            let mut plot = mzplot!(Plot::new("spec").height(ui.available_height()).allow_drag(false).allow_boxed_zoom(false).x_axis_label("m/z")
+            let mut plot = mzplot!(Plot::new("spec").height(ui.available_height()).allow_drag(false).allow_boxed_zoom(false).allow_scroll(!alt).x_axis_label("m/z")
                 .y_axis_label(if norm { "Intensity (% of maximum)" } else { "Intensity" }), norm);
             if reset_now { plot = plot.reset(); }
             let pr = plot.show(ui, |pu| {
@@ -2060,7 +2141,7 @@ impl App {
                             RichText::new(mz4(*m)).size(11.0).color(Color32::BLACK).background_color(Color32::from_rgba_unmultiplied(255, 255, 255, 215)))
                             .anchor(egui::Align2::CENTER_BOTTOM));
                     }
-                } else if let Some(p) = pu.pointer_coordinate() {
+                } else if let Some(p) = pu.pointer_coordinate().filter(|p| pu.response().hovered() && in_view(p, &pu.plot_bounds())) {
                     // snap to the peak closest to the cursor and show only its RT and m/z
                     let b = pu.plot_bounds();
                     let (xw, yw) = (b.max()[0] - b.min()[0], b.max()[1] - b.min()[1]);
@@ -2089,10 +2170,10 @@ impl App {
                         csv_req = Some((stem, csv_two("m/z", "Intensity", sp.mz.iter().cloned().zip(sp.inten.iter().map(|&v| v as f64)))));
                     }
                     _ => {
-                        let mut ss = vec![SvgSeries { name: "peaks".into(), rgb: (128, 128, 128), width: 1.0, points: all.clone() }];
+                        let mut ss = vec![SvgSeries { name: "peaks".into(), rgb: (128, 128, 128), width: 1.0, points: all.clone(), marker: false }];
                         let mut vl = vec![];
                         for (ci, ion, v) in &hl {
-                            if !v.is_empty() { ss.push(SvgSeries { name: format!("target ion m/z {}", mz4(*ion)), rgb: color_rgb(pal(*ci)), width: 2.0, points: v.clone() }); }
+                            if !v.is_empty() { ss.push(SvgSeries { name: format!("target ion m/z {}", mz4(*ion)), rgb: color_rgb(pal(*ci)), width: 2.0, points: v.clone(), marker: false }); }
                             vl.push(SvgVLine { x: *ion, rgb: color_rgb(pal(*ci)), label: String::new() });
                         }
                         let labels: Vec<SvgLabel> = top10.iter().map(|(m, y)| SvgLabel { x: *m, y: *y * scale, text: mz4(*m), rgb: (0, 0, 0) }).collect();
@@ -2100,7 +2181,7 @@ impl App {
                         export_req = Some((k, SvgPlot {
                             title: head.clone(), x_label: "m/z".into(),
                             y_label: if norm { "Intensity (% of maximum)".into() } else { "Intensity".into() },
-                            series: ss, vlines: vl, labels, bounds: [x0, x1, y0, y1], x_fmt: mz4, y_fmt: yf,
+                            series: ss, vlines: vl, labels, notes: vec![], bounds: [x0, x1, y0, y1], x_fmt: mz4, y_fmt: yf,
                         }, rect, stem));
                     }
                 }
@@ -2211,11 +2292,14 @@ impl App {
             if ui.add_enabled(n_sel > 0, egui::Button::new("Remove concentration")).clicked() { clear = true; }
         });
         ui.weak("Changing the type of a file that is part of a multi-selection sets all selected files to that type.");
+        ui.weak("Only files of type Standard are listed below.");
         ui.weak("Tip: select the replicate files in the sample list (Ctrl/Shift+click), pick the target and the level, press Assign; repeat for the next level.");
         if assign { self.assign_standards(self.assign_target, self.assign_conc); }
         if clear { self.assign_standards(self.assign_target, 0.0); }
         ui.separator();
         let (na, ns) = (self.analytes.len(), self.samples.len());
+        let std_files: Vec<usize> = (0..ns).filter(|&s| self.samples[s].kind == Kind::Standard).collect();
+        if std_files.is_empty() { ui.label("No files are marked as Standard yet: select files in the sample list and press 'Assign as standards' (or set their type to Standard)."); }
         let mut change: Option<(usize, usize, f64)> = None;
         let mut kind_change: Option<(usize, Kind)> = None;
         egui::ScrollArea::both().id_salt("setup").show(ui, |ui| {
@@ -2223,7 +2307,7 @@ impl App {
                 ui.strong("File"); ui.strong("Type");
                 for an in &self.analytes { ui.strong(format!("{} ({})", an.name, self.units)); }
                 ui.end_row();
-                for s in 0..ns {
+                for &s in &std_files {
                     ui.label(&self.samples[s].data.name);
                     let mut k = self.samples[s].kind;
                     egui::ComboBox::new(("setupkind", s), "").selected_text(k.label()).show_ui(ui, |ui| {
@@ -2579,7 +2663,7 @@ mod tests {
         a.trfp_path.clear();
         a
     }
-    fn info(n: usize) -> LoadInfo { LoadInfo { path: format!("synthetic{}.raw", n), raw_sha: "0".repeat(64), detail: String::new(), source: RawSource::Disk(std::path::PathBuf::new()) } }
+    fn info(n: usize) -> LoadInfo { LoadInfo { path: format!("synthetic{}.raw", n), raw_sha: "0".repeat(64), detail: String::new(), source: RawSource::Disk(PathBuf::from(format!("synthetic{}.raw", n))) } }
     fn add(a: &mut App, n: usize, offset: f64, scale: f64) {
         let d = mzml::parse_bytes(&format!("run{}.raw", n), &testkit::synthetic_mzml(offset, scale)).expect("synthetic mzML parses");
         a.add_sample(d, info(n));
@@ -2959,5 +3043,35 @@ mod tests {
         assert_eq!(nearest_boundary(5.2, 5.0, 5.4, 100.0, 8.0), None, "in the middle of the peak a drag draws a zoom window");
         assert_eq!(nearest_boundary(5.2, 5.0, 5.4, 1000.0, 8.0), None);
         assert_eq!(nearest_boundary(5.004, 5.0, 5.4, 1000.0, 8.0), Some(true));
+    }
+
+    #[test]
+    fn wheel_scaling_keeps_the_pivot_in_place() {
+        assert_eq!(scale_range(0.0, 10.0, 5.0, 0.5), (2.5, 7.5));
+        assert_eq!(scale_range(0.0, 10.0, 0.0, 0.5), (0.0, 5.0), "pivot at the edge: that edge stays");
+        assert_eq!(scale_range(0.0, 10.0, 5.0, 2.0), (-5.0, 15.0), "factor > 1 zooms out");
+        let (lo, hi) = scale_range(100.0, 200.0, 120.0, 0.25);
+        assert!((120.0 - lo) / (hi - lo) - 0.2 < 1e-12, "relative pivot position is unchanged");
+    }
+
+    #[test]
+    fn cursor_following_is_limited_to_the_data_area() {
+        let b = PlotBounds::from_min_max([2.0, 0.0], [8.0, 100.0]);
+        assert!(in_view(&PlotPoint::new(5.0, 50.0), &b));
+        assert!(in_view(&PlotPoint::new(2.0, 0.0), &b), "the border counts as inside");
+        assert!(!in_view(&PlotPoint::new(1.9, 50.0), &b), "over the y axis labels");
+        assert!(!in_view(&PlotPoint::new(5.0, -3.0), &b), "below the x axis");
+        assert!(!in_view(&PlotPoint::new(8.5, 50.0), &b));
+    }
+
+    #[test]
+    fn only_standards_are_listed_in_the_setup_matrix() {
+        let mut a = app();
+        for i in 0..3 { add(&mut a, i, 0.0, 1.0); }
+        let listed = |a: &App| (0..a.samples.len()).filter(|&s| a.samples[s].kind == Kind::Standard).count();
+        assert_eq!(listed(&a), 0);
+        a.apply_click(1, false, false);
+        a.set_type(1, Kind::Standard);
+        assert_eq!(listed(&a), 1);
     }
 }

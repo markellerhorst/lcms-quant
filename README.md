@@ -1,7 +1,5 @@
 # LC-MS/MS Quant
 
-![App Screenshot](img/lcms-quant-ico.png)
-
 Desktop app (Windows, macOS) for **targeted quantification of LC-MS/MS data** from Thermo `.raw` and mzML files.
 Repository: <https://github.com/markellerhorst/lcms-quant>
 
@@ -23,13 +21,13 @@ chromatograms, integrates the peaks (boundaries adjustable by hand, values updat
 - **Quick XIC** for any m/z (MS1 or MS2) without defining a target; "Add as target" makes it permanent
 - Hover read-out on chromatograms (m/z, RT, scan, precursor m/z, intensity) and a linked **MS2 spectrum panel**; the cursor snaps to the nearest peak (RT + m/z)
 - Explorer-style multi-select (Ctrl / Shift), right-click to remove a file from the project (never deletes it on disk)
-- Natural zoom: drag a box around a peak to zoom to it (chromatograms and MS2 spectra), Shift/middle-drag pans, right-click → *Reset zoom*;
-  integration boundaries are moved by grabbing the start/end line itself
+- Natural zoom: drag a box around a peak to zoom to it (chromatograms and MS2 spectra), Shift/middle-drag pans, **Alt+wheel** scales the y axis and
+  **Shift+Alt+wheel** the x axis, right-click → *Reset zoom*; integration boundaries are moved by grabbing the start/end line itself.
+  Hover read-outs and zoom gestures only react while the pointer is inside the plot area
+- The calibration curve (points, excluded points, fit) can be saved as PNG / SVG; the regression formula and R² are drawn inside the plot
 - Right-click any chromatogram or MS2 spectrum → save as **PNG**, **SVG** (spectra carry the m/z of the 10 strongest peaks) or a **two-column CSV** (RT/Intensity, m/z/Intensity); file names say what is exported (TIC, BPC, XIC, MS2 scan)
 - Projects (`.quant`) that **contain the raw files** (optional), undo/redo (10 steps), zoom with Ctrl +/-/0, user name in the audit trail
 - Numbers in scientific notation (`10²`), except retention times (`7.20` min) and m/z values (`286.1438`); normalised views show 0–100 %
-
-![App Screenshot](img/20261104_app_screenshot.png)
 
 ## Build
 Requirements: [Rust](https://rustup.rs) (stable); on Windows additionally the *Visual Studio Build Tools* with the
@@ -52,13 +50,43 @@ cargo run --release          # or: cargo build --release  -> target/release/lcms
    MS2 product ions separated by `;` (the first is the quantifier) and, optionally, the MS1 precursor as `p:286.1438`, e.g.
    `Morphine,n/a,286.14;201.07;165.05;p:286.1438`.
 2. **Calibration setup** tab: select the replicate files of one level (Ctrl/Shift+click in the sample list), choose the target and the concentration,
-   press *Assign as standards*; repeat for every level and target. Samples keep the type *Unknown*. The matrix below allows per-cell edits.
+   press *Assign as standards*; repeat for every level and target. Only files of type *Standard* are listed in the matrix below; it allows per-cell edits.
    Setting the type (Standard, Unknown, QC, Blank) of a file that is part of a multi-selection sets **all selected files** to that type.
 3. Choose the signal (MS2 product ions or MS1 precursor) in the top bar. Check/adjust the integrated peaks; give a reason for manual changes.
    Replicates can be excluded from a curve with the checkbox in the calibration table.
 4. Export the results (`Export CSV`), save the project (`Ctrl+S`). A project embeds the original files, so it can be opened on another PC
    (ThermoRawFileParser is needed there for `.raw`). While opening, each embedded `.raw` is copied to a temporary file for the converter and deleted again
    immediately; the data itself stays in memory. Untick *Embed raw files when saving projects* to save only references + SHA-256.
+
+## How quantification works
+
+**Signal (top bar → "Signal")** decides which chromatogram of a target is integrated. Retention times are first shifted by the alignment (if used).
+
+| | **MS2 product-ion mode** (default) | **MS1 precursor mode** |
+|---|---|---|
+| Traces per target | one extracted-ion chromatogram (XIC) for every listed product ion | one XIC for the precursor m/z (`p:` in the target table) |
+| Scans used | all MS2 scans (the precursor that was fragmented is shown but *not* used as a filter) | all MS1 scans |
+| XIC point | per scan: sum of the intensities of all peaks within ±m/z tolerance (ppm or Da) of the m/z | same |
+| Quantifier | the **first** product ion; the others are qualifiers | the precursor trace |
+| Ion-ratio check | qualifier area / quantifier area compared with the mean ratio of the included standards (±tolerance, default 30 %) → flag *ionN ratio fail* | not applicable |
+| Missing precursor | – | target gets no peak (ND); add `p:<m/z>` to the table |
+
+**Peak detection and integration** (identical in both modes)
+1. The apex is the highest point of the quantifier trace, searched within the expected RT ± *RT window* (default 0.30 min), or in the whole run when the RT is `n/a`.
+2. Automatic boundaries walk away from the apex until the signal falls below 5 % of the apex height or rises again on two consecutive points.
+3. All traces of a target in a file share the same boundaries. You can move them by grabbing the lines or typing values; manual boundaries are logged with a reason and kept until reset.
+4. The area is the trapezoid sum between the boundaries (boundary values interpolated), in intensity·seconds. With *Linear baseline subtraction* a straight line between the signal at the two
+   boundaries is subtracted. Because the automatic boundaries end at 5 % of the apex, this also removes that 5 % pedestal (areas ≈ 10 % lower than the full peak);
+   standards and samples are treated identically, so concentrations are not affected, but absolute areas are not comparable with other software unless the boundaries are widened.
+
+**Calibration** (mode *Standard curve*; one calibration per target and per signal)
+- Standards are files of type *Standard* that carry a concentration > 0 for that target. A file can be a standard for several targets with different concentrations; replicates are files with the same concentration.
+- Points are (concentration, quantifier area). All replicates are used by default; any replicate can be excluded in the calibration table (the curve updates at once).
+  At least two different levels are needed.
+- Fit: area = slope · concentration + intercept (not forced through zero), weighted least squares with weights 1, 1/x or 1/x² (x = concentration). R² is calculated unweighted.
+- Result for a sample: concentration = (area − intercept) / slope. Flags: *ND* (no peak), *outside cal range* (below the lowest / above the highest included standard), *PEAK IN BLANK*,
+  *accuracy >15 %* (back-calculated standards), *manual* (hand-set boundaries).
+- Switching between MS2 and MS1 keeps the standard assignments but refits every calibration from the other signal's areas. In *Areas only* mode no calibration is used and areas are reported in arbitrary units.
 
 ## Project file size
 A `.quant` project that embeds its raw files is as large as the raw files together (often several GB). Saving runs in the background and

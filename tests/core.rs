@@ -430,12 +430,12 @@ fn svg_export_contains_axes_series_and_escapes_text() {
     let plot = svg::SvgPlot {
         title: "run <1> & \"x\"".into(), x_label: "Retention time (min)".into(), y_label: "Intensity (% of maximum)".into(),
         series: vec![
-            svg::SvgSeries { name: "m/z 150.0000".into(), rgb: (31, 119, 180), width: 2.0, points: vec![[7.0, 0.0], [7.2, 100.0], [7.4, 0.0]] },
-            svg::SvgSeries { name: "empty".into(), rgb: (0, 0, 0), width: 1.0, points: vec![] },
+            svg::SvgSeries { name: "m/z 150.0000".into(), rgb: (31, 119, 180), width: 2.0, points: vec![[7.0, 0.0], [7.2, 100.0], [7.4, 0.0]], marker: false },
+            svg::SvgSeries { name: "empty".into(), rgb: (0, 0, 0), width: 1.0, points: vec![], marker: false },
         ],
         vlines: vec![svg::SvgVLine { x: 7.2, rgb: (0, 100, 0), label: "start".into() }],
         labels: vec![svg::SvgLabel { x: 7.2, y: 100.0, text: "286.1438".into(), rgb: (0, 0, 0) }],
-        bounds: [7.0, 7.4, 0.0, 100.0], x_fmt: rt2, y_fmt: pct0,
+        notes: vec![], bounds: [7.0, 7.4, 0.0, 100.0], x_fmt: rt2, y_fmt: pct0,
     };
     let s = svg::render(&plot);
     assert!(s.starts_with("<svg ") && s.trim_end().ends_with("</svg>"));
@@ -459,4 +459,24 @@ fn project_blob_reader_returns_the_embedded_bytes() {
     let (o, l) = offs[0].unwrap();
     assert_eq!(lcms_quant::project::read_blob(&out, o, l).unwrap(), b"<mzML>demo</mzML>");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn svg_calibration_plot_has_markers_line_and_formula_box() {
+    let plot = svg::SvgPlot {
+        title: "Calibration curve · Morphine".into(), x_label: "Concentration (ng/mL)".into(), y_label: "Area (intensity·s)".into(),
+        series: vec![
+            svg::SvgSeries { name: "used".into(), rgb: (31, 119, 180), width: 1.0, points: vec![[1.0, 250.0], [2.0, 510.0], [4.0, 990.0]], marker: true },
+            svg::SvgSeries { name: "excluded".into(), rgb: (150, 150, 150), width: 1.0, points: vec![[2.0, 700.0]], marker: true },
+            svg::SvgSeries { name: "fit".into(), rgb: (214, 39, 40), width: 2.0, points: vec![[0.0, 10.0], [4.2, 1030.0]], marker: false },
+        ],
+        vlines: vec![], labels: vec![],
+        notes: vec!["area = 2.45×10²·conc + 1×10¹".into(), "R² = 9.9987×10⁻¹   n = 4".into(), "weighting 1/x²".into()],
+        bounds: [0.0, 5.0, 0.0, 1200.0], x_fmt: sci3, y_fmt: sci3,
+    };
+    let s = svg::render(&plot);
+    assert_eq!(s.matches("<path ").count(), 1, "only the fit is a line");
+    assert!(s.matches("<circle").count() >= 4 + 2, "4 data points + legend markers");
+    assert!(s.contains("area = 2.45×10²·conc + 1×10¹") && s.contains("R² = 9.9987×10⁻¹"), "regression formula and R² are inside the figure");
+    assert!(s.contains("weighting 1/x²"));
 }
